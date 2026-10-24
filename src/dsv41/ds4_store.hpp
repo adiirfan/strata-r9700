@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::ds4 {
@@ -108,6 +109,7 @@ public:
         return true;
     }
     ~ExpertStore() {
+        warm_stop();
         io_.reset();
         for (size_t i = 0; i < chunks_.size(); ++i)
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
@@ -245,6 +247,53 @@ public:
             io_->wait_any(5000);
         }
         return n;
+    }
+    /// `list` (hottest first) read into free slots in the background, at most `depth` reads in flight, so the reads a token
+    /// asks for meanwhile are not queued behind all of them (preload's warm slots, without the wait).  A list given while one
+    /// is still being read replaces it.
+    void warm_async(const std::vector<std::pair<int, int>>& list, int depth) {
+        warm_stop();
+        warm_quit_.store(false);
+        std::vector<std::pair<int, int>> todo(list.begin(), list.begin() + (long) std::min(list.size(), nmax_));
+        warm_th_ = std::thread([this, todo = std::move(todo), depth] {
+            size_t next = 0;
+            while (!warm_quit_.load(std::memory_order_acquire)) {
+                bool loading_left = false;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    int in_flight = 0;
+                    for (size_t j = 0; j < nalloc_; ++j) {
+                        Slot& sp = slots_[j];
+                        if (sp.state.load(std::memory_order_acquire) != kLoading) continue;
+                        if (sp.left.load(std::memory_order_acquire) == 0) {
+                            try_ready(sp);
+                            if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+                        }
+                        if (sp.state.load(std::memory_order_acquire) == kLoading) ++in_flight;
+                    }
+                    while (in_flight < depth && next < todo.size()) {
+                        const int layer = todo[next].first, e = todo[next].second;
+                        ++next;
+                        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
+                        if (where_[(size_t) layer][(size_t) e] >= 0) continue;
+                        const int sl = start_fill(layer, e, false);
+                        if (sl < 0) {
+                            next = todo.size();
+                            break;
+                        }
+                        slots_[(size_t) sl].prefetch = false;   // (warm, not a guess)
+                        ++in_flight;
+                    }
+                    loading_left = in_flight > 0;
+                }
+                if (next >= todo.size() && !loading_left) break;
+                io_->wait_any(20);
+            }
+        });
+    }
+    void warm_stop() {
+        warm_quit_.store(true, std::memory_order_release);
+        if (warm_th_.joinable()) warm_th_.join();
     }
     /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
     void cancel_stale(int layer_now) {
@@ -524,6 +573,8 @@ private:
     uint64_t clock_ = 0;
     std::mutex mu_;
     std::unique_ptr<IoQueue> io_;
+    std::thread warm_th_;              // warm_async's reader
+    std::atomic<bool> warm_quit_{false};
     Stats st_;
 };
 

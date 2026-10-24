@@ -528,6 +528,16 @@ struct Chunk {
     uint16_t *x16 = nullptr, *qr16 = nullptr, *o16 = nullptr, *oa16 = nullptr, *lat16 = nullptr, *sh16 = nullptr,
              *h16 = nullptr, *eg_x16 = nullptr, *ext = nullptr, *w16 = nullptr, *emb = nullptr;
     size_t w16_elems = 0;
+    // the dense matrices' F16 images kept for the whole chunk (DS4_W16C_MB, 0: off): a layer's matrices are
+    // dequantized once, not once for each attention slab; filled in order, emptied when the next one does not fit
+    uint16_t* wc = nullptr;
+    size_t wc_elems = 0, wc_used = 0;
+    struct WcEntry {
+        const void* key;
+        int k, n;
+        size_t off;
+    };
+    std::vector<WcEntry> wc_map;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *bounds = nullptr, *row_tok = nullptr, *pos = nullptr;
     uint8_t* eg_rows = nullptr;
     int* bounds_pin = nullptr;   // pinned: the sort's bounds, read back
@@ -2832,6 +2842,10 @@ struct Model::Impl {
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
             c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
             c.w16_elems = (size_t) 8 << 20;
+            {
+                const char* v = std::getenv("DS4_W16C_MB");
+                c.wc_elems = ((size_t) (v != nullptr ? std::max(0, std::atoi(v)) : 256) << 20) / 2;
+            }
             bool has_eg = false, has_first = false;
             size_t stride = 0;
             for (const Layer& l : L)
@@ -2861,6 +2875,7 @@ struct Model::Impl {
                       dalloc(d, c.row_tok, C * kPicks, err) && dalloc(d, c.pos, C * kPicks, err) &&
                       dalloc(d, c.sg, C * FF, err) && dalloc(d, c.su, C * FF, err) && dalloc(d, c.sh16, C * FF, err) &&
                       dalloc(d, c.h16, C * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
+                      (c.wc_elems == 0 || dalloc(d, c.wc, c.wc_elems, err)) &&
                       halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
@@ -2901,6 +2916,34 @@ struct Model::Impl {
     bool gemm(Dev& d, Chunk& c, const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta,
               std::string& err) {
         if (rows <= 0) return true;
+        if (c.wc != nullptr && (size_t) m.k * m.n <= c.wc_elems) {   // the whole matrix's F16 image, made once
+            const void* key = m.fmt != 0 ? m.raw : (const void*) m.trellis;
+            const uint16_t* W = nullptr;
+            for (const Chunk::WcEntry& e : c.wc_map)
+                if (e.key == key && e.k == m.k && e.n == m.n) W = c.wc + e.off;
+            if (W == nullptr) {
+                const size_t ne = ((size_t) m.k * m.n + 63) / 64 * 64;
+                if (c.wc_used + ne > c.wc_elems) {   // (stream order: the slots' earlier users have run by then)
+                    c.wc_map.clear();
+                    c.wc_used = 0;
+                }
+                uint16_t* dst = c.wc + c.wc_used;
+                if (m.fmt != 0) gg::rows(m, dst, false, d.st);
+                else x3::reconstruct_rows(m, dst, false, d.st);
+                c.wc_map.push_back({key, m.k, m.n, c.wc_used});
+                c.wc_used += ne;
+                W = dst;
+            }
+            const float one = 1.0f;
+            const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, m.n, rows, m.k, &one, W, CUDA_R_16F, m.k,
+                                                   x16, CUDA_R_16F, ldx, &beta, y, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
+                                                   CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (st != CUBLAS_STATUS_SUCCESS) {
+                err = "cublasGemmEx: status " + std::to_string((int) st);
+                return false;
+            }
+            return true;
+        }
         const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
         for (int c0 = 0; c0 < m.n; c0 += cols) {
             const int nc = std::min(cols, m.n - c0);
@@ -5939,9 +5982,17 @@ struct Model::Impl {
                 if (list.size() >= store->slots_max()) break;
                 list.push_back(h.second);
             }
-            const double ts = now_ms();
-            const size_t n = store->preload(list, 0);
-            if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts read after the prompt (%.0f ms)\n", n, now_ms() - ts);
+            // DS4_SETTLE_ASYNC (1): read in the background, a few at a time, while the answer starts (0: the prompt waits
+            // for all of them, as before: ~7 s of a 4-8K prompt on a 4.5 GB/s disk)
+            static const int warm_depth = (int) env_f("DS4_SETTLE_ASYNC", 24.0f);
+            if (warm_depth > 0) {
+                store->warm_async(list, warm_depth);
+                if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts to read in the background\n", list.size());
+            } else {
+                const double ts = now_ms();
+                const size_t n = store->preload(list, 0);
+                if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts read after the prompt (%.0f ms)\n", n, now_ms() - ts);
+            }
         }
         if (o.verbose && st.swaps > s0)
             std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),

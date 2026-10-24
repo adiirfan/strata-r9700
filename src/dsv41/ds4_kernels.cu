@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <cstdio>
@@ -945,6 +946,187 @@ __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __r
     if (i >= n_sel) return;
     const size_t r = (size_t) t * cap + i;
     unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
+}
+
+// ---------------------------------------------------------------- the prompt's sparse attention on gfx12 matrix cores
+// 16 heads of one query a block (4 waves): each pass stages 32 of the query's rows as BF16 (the window's as they are,
+// the packed ones decoded - exact), once for the 16 heads; the scores Q.K^T and the sums P.V are BF16 WMMAs with FP32
+// accumulation.  Q and P go in as BF16 hi + lo pairs (two WMMAs each), the rows are exact in BF16, so the products
+// keep FP32-level precision; only the summation order differs from sparse_attn_packed_kernel (online softmax per
+// head, the same sink term).  Wave w owns dims [128 w, 128 w + 128): its share of each score (reduced over the waves in
+// shared memory) and those dims of the output.  gfx12 fragments (checked on gfx1201): A lane l holds A[l % 16][8 (l /
+// 16) + j], B lane l B[8 (l / 16) + j][l % 16], C/D lane l D[8 (l / 16) + i][l % 16].
+#if defined(STRATA_USE_HIP) && (defined(__gfx1200__) || defined(__gfx1201__))
+#define DS4_ATTN_W12 1
+#else
+#define DS4_ATTN_W12 0
+#endif
+typedef __bf16 aw_bf8 __attribute__((ext_vector_type(8)));
+typedef float aw_f8 __attribute__((ext_vector_type(8)));
+constexpr int kAwHeads = 16, kAwRows = 32, kAwThreads = 128, kAwStride = 512 + 8;
+
+__device__ __forceinline__ aw_f8 aw_mma(aw_bf8 a, aw_bf8 b, aw_f8 c) {
+#if DS4_ATTN_W12
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+#else
+    (void) a;
+    (void) b;
+    __builtin_trap();
+    return c;
+#endif
+}
+__device__ __forceinline__ __bf16 aw_hi(float v) {   // (truncated: hi + lo = v to ~16 bits more)
+    return __builtin_bit_cast(__bf16, (uint16_t) (__float_as_uint(v) >> 16));
+}
+__device__ __forceinline__ __bf16 aw_lo(float v) { return (__bf16) (v - __uint_as_float(__float_as_uint(v) & 0xffff0000u)); }
+
+__global__ void __launch_bounds__(kAwThreads) sparse_attn_wmma_kernel(const float* __restrict__ q,
+                                                                      const uint16_t* __restrict__ win,
+                                                                      const uint8_t* __restrict__ ckv,
+                                                                      const int* __restrict__ sel, int sel_stride,
+                                                                      AttnRows ar, const float* __restrict__ sink,
+                                                                      int heads, float scale, float* __restrict__ out) {
+#if DS4_ATTN_W12
+    constexpr int d = 512;
+    const int hb = blockIdx.x * kAwHeads, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, d);
+    __shared__ __align__(16) uint16_t tile[kAwRows * kAwStride];
+    __shared__ float spart[4][kAwHeads][kAwRows + 1];
+    __shared__ float ps[kAwHeads][kAwRows + 1];
+    __shared__ const uint8_t* rows[kAwRows];
+    __shared__ float m_run[kAwHeads], den[kAwHeads], alpha[kAwHeads];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, lo = lane & 15, hi = lane >> 4;
+    const int dbase = 128 * w;
+    // this wave's Q fragments (its 128 dims: 8 k-steps), hi and lo
+    aw_bf8 qh[8], ql[8];
+    {
+        const float* qr = q + ((size_t) t * heads + hb + lo) * d + dbase + 8 * hi;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = qr[16 * ks + j];
+                qh[ks][j] = aw_hi(v);
+                ql[ks][j] = aw_lo(v);
+            }
+    }
+    if (tid < kAwHeads) {
+        m_run[tid] = -1e30f;
+        den[tid] = 0.0f;
+    }
+    aw_f8 acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = aw_f8{};
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += kAwRows) {
+        const int nt = min(kAwRows, total - t0);
+        if (tid < nt) {
+            const int j = t0 + tid;
+            rows[tid] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
+        }
+        __syncthreads();
+        for (int i = tid; i < kAwRows * 16; i += kAwThreads) {   // the tile: row i / 16, values 32 (i % 16) ..
+            const int r = i >> 4, part = i & 15;
+            uint4* dst = (uint4*) (tile + r * kAwStride + part * 32);
+            if (r >= nt) {
+                dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0, 0, 0, 0);
+            } else if (t0 + r < n_win) {
+                const uint4* src = (const uint4*) (rows[r] + part * 64);
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = src[3];
+            } else {
+                unpack32(rows[r], part, dst);
+            }
+        }
+        __syncthreads();
+        // this wave's share of the scores: 16 heads x 32 rows over its 128 dims
+#pragma unroll
+        for (int nb = 0; nb < 2; ++nb) {
+            aw_f8 s = {};
+            const uint16_t* kr = tile + (nb * 16 + lo) * kAwStride + dbase + 8 * hi;
+#pragma unroll
+            for (int ks = 0; ks < 8; ++ks) {
+                const aw_bf8 b = __builtin_bit_cast(aw_bf8, *(const uint4*) (kr + 16 * ks));
+                s = aw_mma(qh[ks], b, s);
+                s = aw_mma(ql[ks], b, s);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) spart[w][8 * hi + i][nb * 16 + lo] = s[i];
+        }
+        __syncthreads();
+        // the softmax: wave w's heads 4 w .. 4 w + 3, a lane a row
+#pragma unroll
+        for (int hh = 0; hh < 4; ++hh) {
+            const int h = 4 * w + hh;
+            float sv = -INFINITY;
+            if (lane < nt) sv = (spart[0][h][lane] + spart[1][h][lane] + spart[2][h][lane] + spart[3][h][lane]) * scale;
+            const float m_old = m_run[h], m_new = fmaxf(m_old, warp_max(sv));
+            const float p = lane < nt ? expf(sv - m_new) : 0.0f;
+            const float sum = warp_sum(p);
+            ps[h][lane] = p;
+            if (lane == 0) {
+                const float a = expf(m_old - m_new);
+                alpha[h] = a;
+                den[h] = den[h] * a + sum;
+                m_run[h] = m_new;
+            }
+        }
+        __syncthreads();
+        // the running output: rescaled, then + P.V over the tile's 32 rows (two k-steps)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float a = alpha[8 * hi + i];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[j][i] *= a;
+        }
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            aw_bf8 ph, pl;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = ps[lo][16 * ks + 8 * hi + j];
+                ph[j] = aw_hi(v);
+                pl[j] = aw_lo(v);
+            }
+            const uint16_t* vr = tile + (16 * ks + 8 * hi) * kAwStride + dbase + lo;
+#pragma unroll
+            for (int nb = 0; nb < 8; ++nb) {
+                aw_bf8 b;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) b[j] = __builtin_bit_cast(__bf16, vr[j * kAwStride + 16 * nb]);
+                acc[nb] = aw_mma(ph, b, acc[nb]);
+                acc[nb] = aw_mma(pl, b, acc[nb]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int h = 8 * hi + i;
+        const float dn = den[h] + expf(sink[hb + h] - m_run[h]);
+        float* ov = out + ((size_t) t * heads + hb + h) * d + dbase + lo;
+#pragma unroll
+        for (int nb = 0; nb < 8; ++nb) ov[16 * nb] = acc[nb][i] / dn;
+    }
+#else
+    (void) q; (void) win; (void) ckv; (void) sel; (void) sel_stride; (void) ar; (void) sink; (void) heads; (void) scale;
+    (void) out;
+    __builtin_trap();
+#endif
 }
 
 template <int G>
@@ -2002,6 +2184,33 @@ static int sm_count() {
     return v;
 }
 
+// sparse_attn_wmma_kernel: from this many queries a call (fewer: the decode's kernels)
+constexpr int kAwMinT = 16;
+// the current device a gfx12 card the matrix-core attention was built for, and DS4_ATTN_WMMA not 0 (cached a device)
+static bool attn_wmma_ok() {
+#if defined(STRATA_USE_HIP)
+    static const bool env_on = [] {
+        const char* v = std::getenv("DS4_ATTN_WMMA");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!env_on) return false;
+    static std::atomic<int> cached[64];   // 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = cached[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp p{};
+        v = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                    (std::strncmp(p.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(p.gcnArchName, "gfx1201", 7) == 0)
+                ? 1 : 2;
+        cached[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+#else
+    return false;
+#endif
+}
+
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
@@ -2028,6 +2237,12 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                 return;
             }
         }
+    }
+    // a prompt's queries on a gfx12 card: the matrix-core kernel (DS4_ATTN_WMMA=0: the kernels below, as before)
+    if (heads_per_block == 0 && T >= kAwMinT && heads % kAwHeads == 0 && attn_wmma_ok()) {
+        sparse_attn_wmma_kernel<<<dim3(heads / kAwHeads, T), kAwThreads, 0, s>>>(q, win, (const uint8_t*) ckv, sel,
+                                                                                 sel_stride, a, sink, heads, scale, out);
+        return;
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
