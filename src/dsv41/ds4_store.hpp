@@ -255,8 +255,23 @@ public:
         warm_stop();
         warm_quit_.store(false);
         std::vector<std::pair<int, int>> todo(list.begin(), list.begin() + (long) std::min(list.size(), nmax_));
-        warm_th_ = std::thread([this, todo = std::move(todo), depth] {
-            size_t next = 0;
+        // ages by rank, not by read time: the slots are given back oldest first, so the hottest (read first) get the newest
+        // age and a listed expert already here is made as young as its rank - the reads a token asks for later are newer still
+        uint64_t base;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            base = clock_;
+            clock_ += todo.size();
+            for (size_t k = 0; k < todo.size(); ++k) {
+                const int layer = todo[k].first, e = todo[k].second;
+                if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
+                const int sl = where_[(size_t) layer][(size_t) e];
+                if (sl >= 0) slots_[(size_t) sl].tick = base + todo.size() - k;
+            }
+        }
+        warm_th_ = std::thread([this, todo = std::move(todo), depth, base] {
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t next = 0, nread = 0;
             while (!warm_quit_.load(std::memory_order_acquire)) {
                 bool loading_left = false;
                 {
@@ -282,13 +297,19 @@ public:
                             break;
                         }
                         slots_[(size_t) sl].prefetch = false;   // (warm, not a guess)
+                        slots_[(size_t) sl].tick = base + todo.size() - (next - 1);
                         ++in_flight;
+                        ++nread;
                     }
                     loading_left = in_flight > 0;
                 }
                 if (next >= todo.size() && !loading_left) break;
                 io_->wait_any(20);
             }
+            if (std::getenv("DS4_WARM_REPORT"))
+                std::fprintf(stderr, "ds4: RAM store: background refill %s: %zu read of %zu listed in %.0f ms\n",
+                             warm_quit_.load() ? "stopped" : "done", nread, todo.size(),
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         });
     }
     void warm_stop() {

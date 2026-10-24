@@ -5982,9 +5982,9 @@ struct Model::Impl {
                 if (list.size() >= store->slots_max()) break;
                 list.push_back(h.second);
             }
-            // DS4_SETTLE_ASYNC (1): read in the background, a few at a time, while the answer starts (0: the prompt waits
+            // DS4_SETTLE_ASYNC (4): read in the background, a few at a time, while the answer starts (0: the prompt waits
             // for all of them, as before: ~7 s of a 4-8K prompt on a 4.5 GB/s disk)
-            static const int warm_depth = (int) env_f("DS4_SETTLE_ASYNC", 24.0f);
+            static const int warm_depth = (int) env_f("DS4_SETTLE_ASYNC", 4.0f);
             if (warm_depth > 0) {
                 store->warm_async(list, warm_depth);
                 if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts to read in the background\n", list.size());
