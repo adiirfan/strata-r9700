@@ -2041,6 +2041,47 @@ void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long
     zc_fix_kernel<<<1, 32, 0, s>>>(plan, idx, zc_tab, k, stage, stride);
 }
 
+// a window's store picks: one thread assigns the slots (each distinct expert once, pick order, at most kPicks) and points the plan at
+// them; meta[0..n) the slots' sources, meta[kPicks] n - then the copies
+__global__ void zc_win_assign_kernel(unsigned long long* __restrict__ plan, const int* __restrict__ idx,
+                                     const unsigned long long* __restrict__ zc_tab, int T, int k, uint8_t* __restrict__ stage,
+                                     size_t stride, unsigned long long* __restrict__ meta) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int ex[kPicks];
+    int n = 0;
+    for (int t = 0; t < T; ++t)
+        for (int i = 0; i < k; ++i) {
+            const int e = t * kPicks + i;
+            if (plan[e] != 0) continue;
+            const int x = idx[e];
+            if (x < 0) continue;
+            const unsigned long long p = zc_tab[x];
+            if (p == 0) continue;
+            int j = 0;
+            while (j < n && ex[j] != x) ++j;
+            if (j == n) {
+                if (n == kPicks) continue;   // (no slot left: the CPU lane's)
+                ex[n] = x;
+                meta[n++] = p;
+            }
+            plan[e] = (unsigned long long) (stage + (size_t) j * stride);
+        }
+    meta[kPicks] = (unsigned long long) n;
+}
+__global__ void zc_win_copy_kernel(const unsigned long long* __restrict__ meta, uint8_t* __restrict__ stage, size_t stride, size_t bytes) {
+    const int j = blockIdx.y;
+    if ((unsigned long long) j >= meta[kPicks]) return;
+    const uint4* src = (const uint4*) meta[j];
+    uint4* dst = (uint4*) (stage + (size_t) j * stride);
+    const size_t n = bytes / 16;
+    for (size_t o = (size_t) blockIdx.x * blockDim.x + threadIdx.x; o < n; o += (size_t) gridDim.x * blockDim.x) dst[o] = src[o];
+}
+void zc_stage_win(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int T, int k, uint8_t* stage,
+                  size_t stride, size_t bytes, unsigned long long* meta, cudaStream_t s) {
+    zc_win_assign_kernel<<<1, 32, 0, s>>>(plan, idx, zc_tab, T, k, stage, stride, meta);
+    zc_win_copy_kernel<<<dim3(64, kPicks), 256, 0, s>>>(meta, stage, stride, bytes);
+}
+
 void init_pre(float* pre, int T, cudaStream_t s) { init_pre_kernel<<<cdiv(T * 8, 128), 128, 0, s>>>(pre, T); }
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {

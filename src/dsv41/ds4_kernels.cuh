@@ -237,6 +237,12 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,
               cudaStream_t s);
+/// zc_stage for a window of T tokens (a verify round): its picks (t, i < k; plan rows kPicks apart) the VRAM table left at 0 whose
+/// expert zc_tab has - each distinct expert once, in pick order, the first kPicks of them - are copied into stage slots 0.. and every
+/// pick of such an expert points at its slot; the rest stay the CPU lane's (the host takes the same ones by the same rule).  `meta`:
+/// device scratch of kPicks + 1 8-byte words.
+void zc_stage_win(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int T, int k, uint8_t* stage,
+                  size_t stride, size_t bytes, unsigned long long* meta, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual

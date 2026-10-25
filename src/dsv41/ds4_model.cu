@@ -1062,6 +1062,7 @@ struct Model::Impl {
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
+    unsigned long long* zc_win_meta = nullptr;   // device: zc_stage_win's slot sources and count (null: a window's store picks stay the CPU lane's)
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
     bool in_ram(const Layer& l, int e) const {   // (DISK_SKIP_W) expert e's pages in RAM now
@@ -4622,6 +4623,12 @@ struct Model::Impl {
                     zc_stage_buf = nullptr;
                     for (Layer& l : L) l.zc.clear();
                 } else {
+                    // DS4_ZC_WIN (1): a verify round's (a window of drafts') store picks too, in the same kPicks slots
+                    if (!(std::getenv("DS4_ZC_WIN") != nullptr && std::atoi(std::getenv("DS4_ZC_WIN")) == 0) &&
+                        cudaMalloc((void**) &zc_win_meta, (kPicks + 1) * 8) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        zc_win_meta = nullptr;
+                    }
                     for (Layer& l : L)
                         if (!l.zc.empty() && cudaMalloc((void**) &l.zc_tab, (size_t) l.n_exp * 8) == cudaSuccess) cudaMemset(l.zc_tab, 0, (size_t) l.n_exp * 8);
                         else if (!l.zc.empty()) {
@@ -6313,6 +6320,18 @@ struct Model::Impl {
                     }
                 }
                 const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
+                // the store's picks the device computes: a token's all (zc_stage), a window's the first kPicks distinct ones in pick
+                // order (zc_stage_win - the same rule, so each lane takes what the other leaves)
+                int zc_n = 0, zc_x[kPicks];
+                auto zc_take = [&](int e) {
+                    if (T == 1) return true;
+                    if (zc_win_meta == nullptr) return false;
+                    for (int j = 0; j < zc_n; ++j)
+                        if (zc_x[j] == e) return true;
+                    if (zc_n == kPicks) return false;
+                    zc_x[zc_n++] = e;
+                    return true;
+                };
                 for (int t = 0; t < T; ++t) {
                     float wsum = 0.0f;   // (DISK_SKIP_W: the token's route weights)
                     if (dsk)
@@ -6331,7 +6350,7 @@ struct Model::Impl {
                         }
                         if (l.slot[(size_t) e] < 0) {
                             l.cpu_hits.push_back(e);
-                            if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
+                            if (!l.zc.empty() && l.zc[(size_t) e] && zc_take(e)) {   // the device computed it from the store's slot
                                 store->touch(li, e);
                                 ++st.store_zc;
                                 continue;
@@ -6542,7 +6561,11 @@ struct Model::Impl {
     bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
         out.clear();
         conf.clear();
-        const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank;
+        // DS4_DSPARK_TRIM=1: only the block's first max_drafts + 1 rows (y and the drafts kept) - the rest were drafted and
+        // thrown away; the block's rows attend to each other, so the kept drafts are not exactly the full block's
+        static const bool trim = std::getenv("DS4_DSPARK_TRIM") != nullptr && std::atoi(std::getenv("DS4_DSPARK_TRIM")) != 0;
+        const int T = trim && max_drafts > 0 ? std::min(g.d_block, max_drafts + 1) : g.d_block, D = g.dim, H = g.hc,
+                  V = g.vocab, R = g.d_rank;
         const int64_t p0 = pos;
         if (g.n_mtp == 0 || T < 1 || T > kWin || p0 + T > o.max_context) return true;
         int tk[kWin];
@@ -8882,6 +8905,8 @@ struct Model::Impl {
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
             } else {   // each distinct expert read once for the window's tokens
+                if (zc_win_meta != nullptr && zc_stage_buf != nullptr && l.zc_tab != nullptr)   // (the store's, as the token path's)
+                    zc_stage_win(d.plan_ptr, d.ridx, l.zc_tab, T, l.k_exp, zc_stage_buf, zc_stride, l.blob, zc_win_meta, s);
                 gf::MoeWin mw;
                 mw.plan_ptr = d.plan_ptr;
                 mw.T = T;
