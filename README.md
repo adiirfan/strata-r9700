@@ -1,58 +1,177 @@
-# strata-r9700: DeepSeek-V4.1-Flash, Nemotron 3.5 Bolt, Recursive Flint and Ling-3.0-flash on one Radeon AI PRO R9700
+# strata-r9700: DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, Nemotron 3.5 Bolt and Recursive Flint on one Radeon AI PRO R9700
 
-This is [Strata](https://github.com/Niko1221/Strata) 0.2.4 (commit `96ca4383`) with four mixture-of-experts models
-running on a 32 GB Radeon AI PRO R9700. Strata 0.2.4 already carries the DeepSeek-V4.1 engine (`src/dsv41/`, from
-Project Maya); this repo tunes it for this card and a fast SSD, and lets Strata's server pass it pictures. The other
-three are programs of their own. All four work behind Strata's server, which offers OpenAI- and Anthropic-compatible
-APIs and a web app. Strata's own README is [README-STRATA.md](README-STRATA.md).
+This is [Strata](https://github.com/Niko1221/Strata) 0.2.4 (commit `96ca4383`) tuned for a 32 GB Radeon AI PRO R9700,
+with three more models beside Strata's own. Every model works behind Strata's server, which offers OpenAI- and
+Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.md](README-STRATA.md).
 
-(This repo was `strata-nemo`, built on an older Strata. Its three engines now sit on 0.2.4. Nemotron, with and without
-its drafter, and Flint give the same output, token for token, as before; Ling builds but was not run again.)
+- **Qwen3.8-Flash-Next** is Strata's own model. This repo adds the R9700 work from
+  [strata-patches](https://github.com/adiirfan/strata-patches): 8-bit matrix maths for prompts, conversation memory that
+  is pinned only as a conversation grows, and experts given back from RAM after a long prompt.
+- **DeepSeek-V4.1-Flash**: Strata 0.2.4 carries its engine (`src/dsv41/`, from Project Maya). This repo tunes it for
+  this card and a fast SSD and lets the server pass it pictures.
+- **Nemotron 3.5 Bolt, Recursive Flint and Ling-3.0-flash** are programs of their own. (This repo was `strata-nemo`,
+  built on an older Strata. Nemotron, with and without its drafter, and Flint give the same output, token for token, on
+  0.2.4 as before. Ling builds, but its model was not on hand for these measurements.)
 
 | Program | Model | Weights | Where they live | Context | Code |
 | --- | --- | --- | --- | ---: | --- |
-| `engine/strata-dsv41` | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), [ISTA-DASLab's 2-bit GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | 138 GB + 111 GB of Engram tables | card + 32 GB of RAM + SSD | 262,144 | `src/dsv41/`, `serve/ds4_images.py` |
+| `engine/strata-dsv41` | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), [ISTA-DASLab's 2-bit GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | 138 GB + 111 GB of Engram tables | card + RAM + SSD | 262,144 | `src/dsv41/`, `serve/ds4_images.py` |
+| `engine/strata-r9700` | [Qwen3.8-Flash-Next](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) (SC117's abliterated GSQ-RCO IQ3_S) | 79 GB, of it 50 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `src/core/`, `src/prefill/`, `src/program/` |
 | `engine/strata-nemo` | [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB), with the [LiLiCorr drafter](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) | 24 GB | all on the card | 262,144 | `src/nemotron/` |
 | `engine/strata-flint` | [Recursive Flint 40B-A2.5B](https://huggingface.co/RecursiveSI/flint), [Q4_1 GGUF](https://huggingface.co/RecursiveSI/flint-int4-gguf) | 26 GB | all on the card | 262,144 | `src/flint/` |
-| `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + system RAM | 131,072 | `src/ling/` |
+| `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + RAM | 131,072 | `src/ling/` |
 
-DeepSeek is far too big for the card or the RAM: its routed experts alone are 132 GB. The card holds the dense
-weights and about 20 GB of experts, 32 GB of RAM holds more, and the rest is read from the SSD as each word needs it
-(see [DeepSeek-V4.1-Flash](#deepseek-v41-flash)).
-Ling is too big for the card. Its attention, shared weights and 23 GB of its experts stay on the card. The processor
-computes the other experts from system RAM, and the card's set changes as the conversation goes on (see
-[Ling-3.0-flash](#ling-30-flash)). Flint can run the same way on a smaller card (`FLINT_PLAN`).
+## Results
 
-## Results through the server
+Every model was measured the same way, through the server, one after another on the same desktop:
 
-Strata's own benchmark, `tools/strata_bench.py`, against the server (`python -m serve.server --engine strata --config
-...`). Medians, thinking off. The R9700 at a 230 W power limit. Speeds are in tokens per second.
+1. **Strata's benchmark,** `tools/strata_bench.py --long`: three short chats, fresh 4K, 16K and 32K prompts, and a
+   six-turn agent session with four tools. Each test three times; the table gives the median.
+2. **A reading and writing sweep,** `tools/r9700/sweep_bench.py`: fresh prompts of 1K to 256K tokens, each answered once
+   with up to 128 tokens and once with up to 1,024.
 
-| Test | DeepSeek | Nemotron | Flint | Ling |
-| --- | ---: | ---: | ---: | ---: |
-| Chat: writing | 13.0 ³ | 125.5 ¹ | 239.2 | 64.0 ² |
-| Chat: first token | 3.68 s | 0.13 s | 0.07 s | 0.91 s |
-| 4K prompt: reading | 584 | 4,890 | 6,610 | 1,055 |
-| 4K prompt: first token | 7.08 s | 0.84 s | 0.62 s | 3.90 s |
-| 16K prompt: reading | 1,240 | 5,203 | 6,313 | 931 |
-| 16K prompt: first token | 13.4 s | 3.18 s | 2.61 s | 17.6 s |
-| 32K prompt: reading | 1,414 | 4,988 | 5,569 | 645 |
-| 32K prompt: first token | 23.5 s | 6.62 s | 5.91 s | 50.9 s |
-| Agent session (6 turns, 4 tools): prompt reused | 69% | 69% | 66% | 69% |
-| Agent session: first token per turn | 12.5 s | 0.65 s | 0.49 s | 5.63 s |
-| Agent session: writing | 12.3 | 104.6 | 208.2 | 62.2 |
-| Runs per test | 3 | 3 | 3 | 2 |
-| Context the server was started with | 262,144 | 262,144 | 262,144 | 65,536 |
+Both send the same request: streamed, greedy (temperature 0), thinking off. The prompts are real text, never repeated
+(the sweep: Strata's README and docs; every prompt starts with a new number so no cache helps). Speeds are the engine's
+own counts in tokens per second; first-token times are measured by the client.
 
-¹ With the drafter. The range is wide (107-223) because it depends on how many of the drafter's guesses the model
-keeps. Flint's writing has the server's guessing on (see [Recursive Flint](#recursive-flint)).
+**The setups:**
+- **DeepSeek:** the leave-out setting at 0.20 and 24K prompt chunks (see [DeepSeek-V4.1-Flash](#deepseek-v41-flash)).
+  *72 GB store*: a 72 GB RAM store, no cap (about 80 GB of RAM in all). *48 GB cap* and *32 GB cap*: the whole server
+  held to that much RAM by the system (systemd `MemoryMax`), with a 38 GB and a 21 GB store.
+- **Qwen:** *all in RAM*: every expert in RAM (about 55 GB). *32 GB cap* and *16 GB cap*: the whole server held to that
+  much RAM, with 20 GB and 5 GB of experts in RAM and the rest read from the SSD.
+- **Nemotron:** with its drafter. **Flint:** with the server's guessing ahead.
 
-² The range is 44-71. The first chat runs before the card holds the experts chat uses; the later ones are faster.
+**Desktop:** AMD Ryzen 5 7500F (6 cores), 96 GB DDR5-5600, a 2 TB Viper VP4300L SSD (PCIe 4.0). Radeon AI PRO R9700
+32 GB at a 230 W power limit (default 300 W). Debian 13, kernel 7.1.8, ROCm 10.2.0a20261009 (AMD TheRock).
 
-³ DeepSeek with a 32 GB RAM store and the leave-out setting at 0.20 (below), thinking off. A short chat answer is
-mostly the slow first seconds after its prompt; a 400-token story writes at 18.2 tokens/s. With nothing else using
-the machine's RAM, the system keeps much of the model's files cached and these prompt speeds are what the card can
-do; with that RAM in use elsewhere, every prompt reads from the SSD (the command-line table below).
+### Strata's benchmark
+
+| Test | DeepSeek, 72 GB store | DeepSeek, 48 GB cap | DeepSeek, 32 GB cap | Qwen, all in RAM | Qwen, 32 GB cap | Qwen, 16 GB cap | Nemotron | Flint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Chat: writing (tokens/s) | 17.9 | 15.3 | 12.0 | 78.3 | 60.1 | 40.9 | 124.4 | 238.0 |
+| Chat: first token | 2.67 s | 3.28 s | 4.05 s | 0.49 s | 0.57 s | 0.89 s | 0.12 s | 0.07 s |
+| 4K prompt: reading (tokens/s) | 720 | 595 | 506 | 2,332 | 1,382 | 504 | 4,930 | 6,829 |
+| 4K prompt: first token | 5.73 s | 6.94 s | 8.15 s | 1.75 s | 2.93 s | 7.99 s | 0.84 s | 0.60 s |
+| 16K prompt: reading (tokens/s) | 1,176 | 1,286 | 1,218 | 3,246 | 2,692 | 1,587 | 5,237 | 6,506 |
+| 16K prompt: first token | 14.11 s | 12.90 s | 13.61 s | 4.98 s | 6.00 s | 10.15 s | 3.16 s | 2.54 s |
+| 32K prompt: reading (tokens/s) | 1,064 | 1,389 | 1,326 | 3,380 | 2,708 | 2,120 | 4,990 | 5,721 |
+| 32K prompt: first token | 31.18 s | 23.89 s | 25.01 s | 9.52 s | 11.87 s | 15.16 s | 6.62 s | 5.76 s |
+| Agent session: prompt reused | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 68% |
+| Agent session: first token per turn | 9.89 s | 12.52 s | 15.01 s | 1.60 s | 2.79 s | 7.55 s | 0.62 s | 0.46 s |
+| Agent session: writing (tokens/s) | 12.5 | 12.9 | 11.7 | 76.6 | 71.6 | 58.9 | 97.5 | 206.5 |
+
+- Nemotron's writing moves with how many of the drafter's guesses the model keeps (105-221 tokens/s over the chats).
+- The agent session reuses 69% of each turn's prompt from the conversation cache in every setup, so its first-token
+  time is the cost of the new part of each turn.
+
+### Reading and writing by prompt size
+
+"Reading" and "First token" are the mean of the two runs at that size. "Writing 128" and "Writing 1,024" are the
+answers with up to 128 and 1,024 tokens. The prompt column gives the size asked for and, in brackets, the tokens the
+model's own tokenizer made of it.
+
+#### DeepSeek, 72 GB store
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,067) | 120 | 8.9 s | 11.4 | 14.0 |
+| 4K (4,212) | 419 | 10.0 s | 13.8 | 15.6 |
+| 16K (14,833) | 837 | 18.7 s | 10.0 | 15.2 |
+| 32K (30,660) | 1,153 | 27.1 s | 14.0 | 16.0 |
+| 64K (63,685) | 1,092 | 58.5 s | 13.9 | 15.7 |
+| 128K (123,616) | 1,088 | 114.3 s | 13.0 | 17.3 |
+| 256K (231,917) | 1,127 | 208.8 s | 14.1 | 18.0 |
+
+#### DeepSeek, 48 GB cap
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,067) | 88 | 12.1 s | 11.8 | 14.4 |
+| 4K (4,212) | 301 | 14.0 s | 12.5 | 15.1 |
+| 16K (14,833) | 716 | 21.1 s | 12.4 | 15.8 |
+| 32K (30,660) | 929 | 33.5 s | 12.5 | 16.1 |
+| 64K (63,685) | 977 | 65.3 s | 13.4 | 16.5 |
+| 128K (123,616) | 943 | 131.9 s | 12.4 | 15.8 |
+| 256K (231,917) | 1,036 | 225.1 s | 12.5 | 16.5 |
+
+#### DeepSeek, 32 GB cap
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,067) | 74 | 14.3 s | 10.3 | 12.2 |
+| 4K (4,212) | 264 | 15.9 s | 11.0 | 13.2 |
+| 16K (14,833) | 670 | 22.3 s | 11.4 | 14.5 |
+| 32K (30,660) | 871 | 35.4 s | 11.4 | 14.4 |
+| 64K (63,685) | 956 | 67.0 s | 12.0 | 14.8 |
+| 128K (123,616) | 829 | 150.0 s | 12.0 | 14.6 |
+| 256K (231,917) | 1,024 | 227.7 s | 12.6 | 14.8 |
+
+#### Qwen, all in RAM
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,077) | 722 | 1.5 s | 80.3 | 84.1 |
+| 4K (4,121) | 2,521 | 1.7 s | 85.3 | 89.4 |
+| 16K (14,852) | 3,135 | 4.8 s | 82.5 | 83.1 |
+| 32K (30,625) | 3,348 | 9.2 s | 85.4 | 84.5 |
+| 64K (65,452) | 3,372 | 19.5 s | 76.1 | 76.7 |
+| 128K (125,056) | 3,217 | 39.0 s | 74.0 | 75.9 |
+| 256K (231,117) | 2,866 | 80.8 s | 67.6 | 69.6 |
+
+#### Qwen, 32 GB cap
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,077) | 400 | 2.7 s | 67.9 | 74.1 |
+| 4K (4,120) | 1,426 | 2.9 s | 76.9 | 80.4 |
+| 16K (14,852) | 2,545 | 5.9 s | 76.6 | 78.5 |
+| 32K (30,625) | 2,604 | 11.8 s | 80.2 | 81.0 |
+| 64K (65,453) | 2,895 | 22.7 s | 74.4 | 74.2 |
+| 128K (125,056) | 2,890 | 43.4 s | 71.7 | 69.9 |
+| 256K (231,117) | 2,555 | 90.6 s | 67.4 | 65.9 |
+
+#### Qwen, 16 GB cap
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,077) | 147 | 7.3 s | 52.3 | 55.9 |
+| 4K (4,121) | 528 | 7.8 s | 70.4 | 55.9 |
+| 16K (14,852) | 1,496 | 10.0 s | 59.2 | 63.2 |
+| 32K (30,625) | 2,019 | 15.3 s | 67.5 | 67.4 |
+| 64K (65,453) | 2,266 | 29.0 s | 57.6 | 58.1 |
+| 128K (125,055) | 2,261 | 55.4 s | 59.2 | 56.6 |
+| 256K (231,116) | 2,017 | 114.8 s | 58.9 | 58.1 |
+
+#### Nemotron
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,045) | 3,294 | 0.3 s | 117.3 | 135.1 (901 written) |
+| 4K (4,041) | 4,899 | 0.8 s | 103.8 | 121.6 (943 written) |
+| 16K (14,693) | 5,002 | 3.0 s | 128.3 | 134.2 |
+| 32K (30,032) | 4,815 | 6.3 s | 107.3 | 129.5 |
+| 64K (64,665) | 4,370 | 14.9 s | 123.6 | 120.8 |
+| 128K (122,962) | 3,699 | 33.4 s | 119.2 | 115.4 |
+| 256K (226,804) | 2,895 | 79.2 s | 103.7 | 104.5 |
+
+#### Flint
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,067) | 4,583 | 0.2 s | 219.4 | 214.5 |
+| 4K (4,210) | 6,792 | 0.6 s | 209.2 | 208.8 |
+| 16K (14,798) | 6,535 | 2.3 s | 200.7 | 190.6 |
+| 32K (30,582) | 5,738 | 5.4 s | 167.0 | 169.2 |
+| 64K (63,613) | 4,549 | 14.1 s | 137.4 | 139.1 |
+| 128K (123,235) | 3,296 | 37.6 s | 116.1 | 108.6 |
+| 256K (233,206) | 2,198 | 106.5 s | 75.6 | 75.1 |
+
+- **DeepSeek's writing hardly moves with the prompt's length:** what limits it is how many experts per word come from
+  the SSD, not the context. Its prompts start slowly because every chunk streams the experts the card does not hold,
+  about 110 GB, so a short prompt pays for one whole pass.
+- **With less RAM,** Qwen's short prompts slow down most (the experts they need come from the SSD); long prompts share
+  each pass over the experts among more tokens and lose less.
 
 ## DeepSeek-V4.1-Flash
 
@@ -60,96 +179,66 @@ DeepSeek-V4.1-Flash-1017 has 40 layers with 384 experts each, 6 used per token, 
 table of 111 GB that each token reads 48 rows of) and a vision tower. The 2-bit GGUF's routed experts are 132 GB, about
 8.6 MB an expert.
 
-**Where it lives** (the settings in [Run through the server](#run-through-the-server)):
-- **Card:** the dense weights (5.9 GB), about 2,250 of the 15,360 experts (19.8 GB) and the working buffers.
-- **RAM:** a 32 GB store of experts (`--ssd-cache 32`) that follows what the conversation uses, read with unbuffered
-  reads so the system's file cache stays out of the way. The engine holds about 38 GB of RAM in all.
-- **SSD:** everything else, read as it is needed. The card reads RAM-store experts straight over PCIe.
-
-**Tokens per second from the command line,** one run per row, context sized to the prompt:
-
-| Prompt | Reading | Writing, the first 48 tokens after it ¹ | Hidden code found ² |
-| ---: | ---: | ---: | :---: |
-| 8K (7,909 tokens) | 333 | 10.1 | |
-| 16K (15,806) | 553 | 9.5 | |
-| 32K (30,435) | 824 | 9.8 | |
-| 64K (63,000) | 918 | | yes |
-| 128K (125,999) | 1,220 | | yes |
-| 256K (247,128) | 1,382 | | yes |
-
-¹ The first seconds after a long prompt are the slowest: reading it moved the card's and the RAM store's experts to
-what the prompt used, and writing needs others. Over a whole 400-token answer after the 32K prompt the average was
-14.4 tokens/s. A 400-token story after a short prompt writes at **18.2 tokens/s**.
-
-² The 64K-256K prompts are Strata's documentation with one sentence added near the start ("the vault access code for
-the archive room is MARIGOLD-7319"), and a question about it at the end. Each answered `MARIGOLD-7319`. Earlier
-builds, with a 72 GB RAM store, also found such a code at 512K and at a full 1,048,576 tokens
-(`--max-context 1048576`, 30 minutes of reading).
-
-- **Why longer prompts read faster:** reading goes in chunks of 24,576 tokens, and each chunk streams every expert the
-  card does not hold, about 110 GB, from RAM and the SSD. A short prompt pays for one full pass, a long one shares
-  each pass among more tokens. The 8K row varies most between runs: 333-554 tokens/s over five runs with these settings.
-- **Why writing is SSD-bound:** each word uses about 240 experts. With 32 GB of RAM and nothing left out, about 8
-  of them a word are neither on the card nor in RAM and were not guessed early enough; the SSD (a Viper VP4300L, PCIe 4.0) gives
-  about 5.4 GB/s for reads of this size, 2 ms an expert, and the next layer cannot start until they are in.
-- **Leaving out cold experts** (`STRATA_DS4_DISK_SKIP_W`, 0.20 here): an expert that is not in VRAM or RAM and whose
-  routing weight is under 0.20 is left out of that token rather than read from the SSD, about 7% of the experts.
-  Writing goes from about 13 to 18-19 tokens/s at 32 GB (two runs each: 13.0 and 12.8 without it, 19.3 and 18.2
-  with it). Against the full model, the same next token 93.6% of the time
-  (KL divergence 0.074); two runs of the full model agree 96.6% of the time (0.081), and a setting of 0.35 drops to
-  90.0% (0.22). Unset, nothing is left out.
+- **Where it lives:** the card holds the dense weights (5.9 GB), about 2,250 of the 15,360 experts and the working
+  buffers. A RAM store (`--ssd-cache`) keeps the experts the conversation uses, read with unbuffered reads, and the card
+  reads them in place over PCIe. Everything else is read from the SSD as it is needed. The engine needs about 9 GB of
+  RAM beyond its store while loading.
+- **Long context:** prompts of 64K-256K tokens with one planted sentence ("the vault access code for the archive room is
+  MARIGOLD-7319") and a question about it at the end: each answered `MARIGOLD-7319`. Earlier builds, with a 72 GB store,
+  also found such a code at 512K and at 1,048,576 tokens (`--max-context 1048576`, 30 minutes of reading).
+- **Leaving out cold experts** (`STRATA_DS4_DISK_SKIP_W`, 0.20 here): an expert that is in neither VRAM nor RAM and
+  whose routing weight is under 0.20 is left out of that token instead of read from the SSD, about 7% of the experts.
+  With a 32 GB store, writing goes from about 13 to 18-19 tokens/s. Against the full model, the same next token 93.6%
+  of the time (KL divergence 0.074); two runs of the full model agree 96.6% of the time (0.081), and a setting of 0.35
+  drops to 90.0% (0.22). Unset, nothing is left out.
+- **Why writing is SSD-bound:** each word uses about 240 experts. With little RAM, several of them a word are neither on
+  the card nor in RAM and were not guessed early enough; the SSD gives about 5.4 GB/s for reads of this size, 2 ms an
+  expert, and the next layer cannot start until they are in.
 - **Pictures** go through Strata's server like the Qwen models'. The vision tower comes from DeepSeek's own checkpoint
   (shard 1 of 48, 0.97 GB, see [Build](#build)); the server resizes each picture as DeepSeek's `image_processor.py`
   does and the engine encodes it.
 
+## Qwen3.8-Flash-Next
+
+What the R9700 work adds, against Strata 0.2.4 with only its own switches, through `strata_bench.py`, 131,072-token
+context (a separate run from the tables above, same desktop):
+
+| Setup | | Chat writing | 4K prompt | 16K prompt | 32K prompt |
+| --- | --- | ---: | ---: | ---: | ---: |
+| All experts in RAM | 0.2.4 | 77.9 | 1,978 | 2,920 | 2,998 |
+| | this repo | 82.2 | 2,414 | 3,302 | 3,460 |
+| 32 GB cap, 23 GB of experts | 0.2.4 | does not load | | | |
+| | 0.2.4 + the lazy conversation memory | 72.2 | 1,263 | 1,911 | 1,991 |
+| | this repo | 70.2 | 2,073 | 2,887 | 2,871 |
+| 16 GB cap, 7 GB of experts | 0.2.4 + the lazy conversation memory | 49.0 | 561 | 1,427 | 1,702 |
+| | this repo | 53.6 | 595 | 1,807 | 2,186 |
+
+- **Under a 32 GB cap, 0.2.4 is stopped by the system while loading:** it pins the conversation memory for the whole
+  context at start. Here it is reserved, and pinned as a conversation grows (`STRATA_KV_HOST_LAZY`, on by default).
+- **The switches** (all opt-in, set in the configs below): `STRATA_PF_FUSED_F8` (the prompt's experts on the FP8 matrix
+  cores), `STRATA_PF_FP8` (its dense products in FP8), `STRATA_PF_DM16` (the experts' outputs in BF16),
+  `STRATA_REFILL_ASYNC` (the card's experts come back while the answer starts), `STRATA_BUDGET_LEND_GIB` and
+  `STRATA_REFILL_BATCH` (with a cap: a long prompt's borrowed experts come back from RAM, in batches),
+  `STRATA_WARMUP_TOKENS` (one throwaway prompt before the server says it is ready).
+- **Output:** the FP8 and BF16 switches change the numbers. On the older Strata, 7 questions about a 20,000-token
+  document answered greedily kept 6 answers word for word and reworded one summary.
+- **Left out** from strata-patches: the RTX 5080 laptop's low-RAM mode (0.2.4 has its own direct and overlapped reads)
+  and the picture-detail ceiling.
+
 ## Nemotron 3.5 Bolt
 
-Tokens per second, one run per row, from the command line.
-
-| Prompt | Reading | Writing | Writing with the drafter | Tokens a round ¹ | Card memory | With the drafter |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 4,323 | 79.9 | 122 | 3.3 | 26.0 GB | 27.6 GB |
-| 4K | 5,753 | 79.3 | 118 | 3.2 | 26.0 GB | 27.7 GB |
-| 16K | 5,433 | 78.3 | 112 | 3.1 | 26.1 GB | 27.8 GB |
-| 32K | 5,097 | 76.9 | 185 | 5.7 | 26.3 GB | 27.9 GB |
-| 64K | 4,555 | 74.1 | 127 | 3.8 | 26.5 GB | 28.2 GB |
-| 128K | 3,730 | 68.8 | 154 | 4.9 | 27.1 GB | 28.7 GB |
-| 256K (261,800 tokens) | 2,746 | 60.7 | 163 | 6.0 | 28.2 GB | 29.8 GB |
-
-¹ Tokens written per round with the drafter: the drafter guesses up to 7 tokens, the model checks them in one step and
-keeps the ones it agrees with, plus one of its own. How many it keeps depends on how predictable the text is, not on
-the prompt's length, so the drafter's speed moves around from row to row.
-
-- **Card memory** here has the context sized to the prompt (`--max-ctx` = prompt + 344). A full 262,144-token context
-  uses the 256K row's memory whatever the prompt.
-- **Short prompts with the drafter:** 123 tokens/s writing a story, 210 answering a worked-arithmetic question
-  (prompts of 26-33 tokens, 400 tokens written).
 - **Quality:** next-token perplexity 4.5656 on 8K tokens of the model's card and 7.5771 on 8K tokens of Strata's
   `docs/DETAILS.md`. The model card scores 4.5612 with every product kept in 16-bit, about 0.1% better.
-- **Same answer with or without the drafter:** with the drafter, the arithmetic answer above is word for word the
+- **Same answer with or without the drafter:** with the drafter, a worked-arithmetic answer is word for word the
   same as plain greedy writing.
 - **Why reading slows down with length:** 80 of the model's 88 layers cost the same for every token. The 8 attention
   layers compare each new token with every one before it, so at 256K they take about half the reading time.
 
 ## Recursive Flint
 
-Tokens per second, one run per row, from the command line, with the context sized for 262,144 tokens.
-
-| Prompt | Reading | Writing | Reading, 8-bit keys | Writing, 8-bit keys |
-| ---: | ---: | ---: | ---: | ---: |
-| 1K | 4,640 | 219 | 4,562 | 216 |
-| 4K | 6,913 | 213 | 6,750 | 211 |
-| 16K | 6,471 | 190 | 6,278 | 194 |
-| 32K | 5,662 | 168 | 5,454 | 175 |
-| 64K | 4,503 | 138 | 4,290 | 150 |
-| 128K | 3,178 | 104 | 2,969 | 120 |
-| 256K (260,000 tokens) | 2,017 | 70.0 | 1,852 | 85.8 |
-
 - **Card memory at its peak:** 30.1-31.4 GB of the card's 32 GB (31.9 GB usable), or 28.4-29.7 GB with 8-bit keys.
   Nothing spills into system memory. The program itself holds 1.5 GB of RAM, mostly the 1.2 GB token table, which
   stays in RAM on purpose.
-- **llama.cpp on the same card** (with Flint support, 16-bit cache): 79 tokens/s writing, reading 5,388 at 4K and
-  4,843 at 16K.
 - **8-bit keys** (`FLINT_K8=1`, off by default) store the long-history layers' keys in 8 bits as well as their
   values. Writing at long context gets faster and 1.8 GB of card memory is freed, but the accuracy loss doubles (below).
 - **Accuracy,** against Flint computed exactly in 64-bit floats (`tools/flint/ref_all.py`), over 512 positions of
@@ -157,14 +246,15 @@ Tokens per second, one run per row, from the command line, with the context size
   The engine picks the same top token as the exact model 95.3% of the time (94.3% with 8-bit keys). For scale,
   rounding the layers' inputs to 8 bits, as llama.cpp does, costs 0.068 on a 300-token text.
 - **Guessing ahead** (on in the server): when the text repeats something earlier in the conversation, the server
-  guesses the next 1-3 tokens and checks them in one step. Copying a function out of a 66,000-token prompt goes from
-  128 to about 190 tokens/s, with the same output as plain greedy writing. On fresh text it guesses only when that
-  pays, so the speed is unchanged. `FLINT_SPEC=0` turns it off.
+  guesses the next 1-3 tokens and checks them in one step, with the same output as plain greedy writing. On fresh
+  text it guesses only when that pays. `FLINT_SPEC=0` turns it off.
 - **Why writing slows down with length:** 14 of the model's 49 layers compare each new token with every token before
   it, and Flint spreads that attention widely, so every word reads the whole stored history: 1.9-2.8 GB at 128K. The
   engine reads it at about 87% of the card's memory bandwidth.
 
 ## Ling-3.0-flash
+
+Not measured again here (its model was not on hand); the notes are from strata-nemo.
 
 Ling-3.0-flash-VL is 124B parameters with 5.5B used per token: 42 layers, 35 of them a linear "delta" attention with a
 running state and 7 of them full attention over a compressed history, and 512 experts a layer, 8 used per token. This
@@ -194,25 +284,13 @@ program reads text only; the picture reader is not wired in.
   it one token before the end of each prompt (`LING_SNAPS`, 4 kept). A turn that extends the last one goes on from
   where it stopped; otherwise from the latest saved state inside the shared part.
 
-## How these were measured
-
-- **Programs:** from the command line for the per-model tables; through the server for the shared table.
-- **Prompts:** real text, not repeated: the ONNX Runtime and llama.cpp documentation, joined and cut to each size.
-  Then 256 tokens written greedily, continuing the text. DeepSeek's prompts are Strata's own documentation, asked to
-  be summed up (8K-32K) or to find the planted code (64K-256K); thinking off.
-- **Card memory:** the card's peak use during the run (GB here as on the card's box: 1,073,741,824 bytes).
-
-**Desktop:**
-- AMD Ryzen 5 7500F (6 cores), 96 GB DDR5-5600, a 2 TB Viper VP4300L SSD (PCIe 4.0).
-- Radeon AI PRO R9700 32 GB at a 230 W power limit (default 300 W).
-- Debian 13, kernel 7.1.8, ROCm 10.2.0a20261009 (AMD TheRock).
-
 ## Build
 
 Build against AMD TheRock ROCm 10 (`pip install "rocm[libraries,devel,device-gfx1201]"` from
 `https://nightly.repo.amd.com/rocm/whl-next/`; the SDK folder is its `_rocm_sdk_devel`):
 
 ```sh
+tools/r9700/build-r9700.sh <ROCm 10 SDK dir>    # writes engine/strata-r9700 (Qwen)
 tools/r9700/build-dsv41.sh <ROCm 10 SDK dir>    # writes engine/strata-dsv41
 tools/r9700/build-nemo.sh <ROCm 10 SDK dir>     # writes engine/strata-nemo
 tools/r9700/build-flint.sh <ROCm 10 SDK dir>    # writes engine/strata-flint
@@ -337,12 +415,38 @@ DeepSeek's config names its pack instead of a model family (its tokenizer and ch
 }
 ```
 
-- `--ssd-cache 32`: the RAM store in GB. More RAM, faster writing: with a leave-out setting of 0.35, 24.6 tokens/s
-  at 72 GB and 19.8 at 16 GB.
+- `--ssd-cache 32`: the RAM store in GB (the tables above: 72, 38 and 21). The engine needs about 9 GB more; under a
+  RAM cap, keep the store that far below it.
 - `DS4_STORE_ZC=1`, `DS4_STORE_ZC_FRAC=75`: the card reads the RAM store's experts in place over PCIe.
 - `DS4_AHEAD=1`: each layer guesses the next one's experts and starts reading them early.
 - `DS4_CHUNK=24576`: prompt chunks of 24,576 tokens (the default on a 28 GB card is 12,288). Long prompts read up to
   twice as fast; the larger buffers keep about 3 GB fewer experts on the card.
+
+Qwen's config, from Strata's own pack and MTP folder (see [README-STRATA.md](README-STRATA.md)); the *all in RAM*
+setup above:
+
+```json
+{
+  "exe": "<repo>/engine/strata-r9700",
+  "args": ["--pack", "<pack dir>", "--native", "<model dir>/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+           "--ple-gguf", "<model dir>/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf",
+           "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto", "--prefill", "auto:32768",
+           "--spec", "4", "--spec-min-p", "0.5", "--mtp", "<mtp dir>", "--max-context", "262144", "--kv", "int8",
+           "--kv-resident", "32768", "--vram-reserve-mib", "700"],
+  "tokenizer": "<pack dir>/tokenizer",
+  "port": 8080,
+  "backend": "hip",
+  "env": {"STRATA_HIPBLASLT_TUNING": "tools/hip/gfx1201-hipblaslt-100500.txt", "STRATA_HIP_WMMA": "1",
+          "STRATA_SELECT_WMMA": "1", "STRATA_PF_FUSED": "1", "STRATA_ROUTE_RESIDENT": "1", "STRATA_UNBUFFERED_LOAD": "1",
+          "HSA_USERPTR_FOR_PAGED_MEM": "0", "STRATA_PF_FP8": "1", "STRATA_PF_FUSED_F8": "1", "STRATA_PF_DM16": "1",
+          "STRATA_REFILL_ASYNC": "1", "STRATA_WARMUP_TOKENS": "4096"}
+}
+```
+
+With a RAM cap, add `"--mmap-experts", "--resident-budget-gib", "20"` (16 GB: `"5"`), `"--prompt-cache", "2",
+"--prompt-cache-every", "0"` and `STRATA_PROMPT_DIRECT=1`, `STRATA_BUDGET_LEND_GIB=3` (16 GB: `1`),
+`STRATA_REFILL_BATCH=32`, and start the server under the cap (`systemd-run --user -p MemoryMax=32G ...`). Leave room for
+the conversation memory: 20 GB of experts under 32 GB holds a 256K conversation, 23 GB does not.
 
 ## How it works
 
@@ -391,12 +495,11 @@ name them.
 
 - The programs take and give token ids. The tokenizer, chat template and API are Strata's Python server (`serve/`).
 - Nemotron's command line writes greedily only.
-- DeepSeek's speed depends on the SSD and on how much RAM the store gets. Writing is about 9-19 tokens/s here, and a
-  prompt costs at least one pass over the experts the card does not hold (7 s for a 4K prompt).
-- DeepSeek's leave-out setting trades some accuracy for speed (above); set it to 0 for the full model.
-- DeepSeek, Nemotron and Ling are built and tested for the R9700 (gfx1201) only. Flint also builds for NVIDIA cards
-  (`tools/cuda/build-flint.sh`).
-- Ling reads text only, up to 131,072 tokens; reading a 32K prompt takes about 50 s.
+- DeepSeek's speed depends on the SSD and on how much RAM its store gets; a prompt costs at least one pass over the
+  experts the card does not hold. Its leave-out setting trades some accuracy for speed; set it to 0 for the full model.
+- DeepSeek, Qwen's R9700 switches, Nemotron and Ling are built and tested for the R9700 (gfx1201) only. Flint also
+  builds for NVIDIA cards (`tools/cuda/build-flint.sh`).
+- Ling reads text only, up to 131,072 tokens.
 
 ## License
 
