@@ -34,6 +34,7 @@ def main() -> int:
     ap.add_argument("url")
     ap.add_argument("out")
     ap.add_argument("--max-context", type=int, default=262144)
+    ap.add_argument("--sizes", help="only these prompt sizes (comma separated, from the list above)")
     a = ap.parse_args()
     base = a.url.rstrip("/")
     text = corpus()
@@ -45,7 +46,8 @@ def main() -> int:
         return 1
     cpt = 20000 / n
     rows = []
-    for size in SIZES:
+    sizes = [int(x) for x in a.sizes.split(",")] if a.sizes else SIZES
+    for size in sizes:
         if size + max(GENS) + 512 > a.max_context:
             continue
         if int(size * cpt) > len(text):
