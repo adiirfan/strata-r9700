@@ -65,6 +65,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import ds4_images  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
 
@@ -4756,6 +4757,8 @@ class Service:
         prompts without adding or replacing one."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
+        if self.family == "deepseek41" and ds4_images.MARK in prompt:     # a picture's place (ds4_images.flatten)
+            prompt = prompt.replace(ds4_images.MARK, ds4_images.PLACEHOLDER)
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
@@ -4825,11 +4828,14 @@ class Service:
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        ds4 = isinstance(self.vision, ds4_images.Ds4Pictures)   # DeepSeek-V4.1: the engine reads the pixels itself
+        ids = encoded_ids = self.encode_prompt(ds4_images.flatten(messages) if ds4 and images_of(messages) else messages,
+                                               tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
+        ds4_pics = None
         images = images_of(messages)
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
@@ -4847,6 +4853,10 @@ class Service:
                 return fetched[src] if src in fetched else Vision.download(src) \
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
+        if images and ds4:
+            ds4_pics = [self.vision.pixels(src) for src in images]
+            ids, ds4_starts = ds4_images.expand(ids, self.vision.image_token, [p[3] for p in ds4_pics])
+        elif images:
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -4907,7 +4917,12 @@ class Service:
             print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
-        if images:
+        if ds4_pics:
+            # (as below: written once nothing above refuses the request)
+            combined = combined_embeddings_path(self.vision.dir, sum(len(p[0]) + 16 for p in ds4_pics) + 8)
+            self.embeddings.path = combined
+            ds4_images.write_dsi(combined, ds4_pics, ds4_starts)
+        elif images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
@@ -8373,6 +8388,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 vcfg["elastic"] = False
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
+        elif (cfg.get("arch") or "") == "deepseek41" and "args" in cfg:
+            # DeepSeek-V4.1's vision tower is in its pack and the engine runs it: no encoder process
+            vision = ds4_images.from_args(engine_args(cfg), loader=Vision.load, work_dir=Vision.work_dir())
+            if vision is not None:
+                print("[strata] images: the engine reads them (the pack's vision tower)", flush=True)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
