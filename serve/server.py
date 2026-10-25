@@ -3950,7 +3950,8 @@ class Service:
 
     def set_family(self, family: str | None) -> None:
         """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
-        token, DSML tool calls, reasoning-effort words).  The others keep the defaults."""
+        token, DSML tool calls, reasoning-effort words; GLM-5.3-Flash: its tool-call form and effort words).  The
+        others keep the defaults."""
         self.family = family
         if family == "deepseek41":
             from serve import dsml
@@ -3958,6 +3959,10 @@ class Service:
             self.stop_ids = {int(eos)}
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
+        elif family == "glm5":                  # GLM-5.3-Flash (strata-glm): calls in GLM's form, as Flint writes them
+            from serve.frontend import to_glm_force
+            self.parser_cls = FlintParser
+            self._force_text = to_glm_force
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -8078,7 +8083,7 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "deepseek41": "deepseek-v4.1-flash"}
+                      "deepseek41": "deepseek-v4.1-flash", "glm5": "glm-5.3-flash"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8093,6 +8098,8 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # GLM-5.3-Flash: temperature 1.0, top_p 0.95 (Project Maya's defaults, thinking or not)
+    "glm5": {"thinking": {"temperature": 1.0, "top_p": 0.95}, "instruct": {"temperature": 1.0, "top_p": 0.95}},
 }
 
 
@@ -8502,6 +8509,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
+    if (cfg.get("arch") or "") == "glm5" and os.environ.get("STRATA_PACK_TEMPLATE") != "1":
+        # GLM-5.3-Flash: the zai-org template with its tool results matched to their calls without nested loops
+        # (zai-org/GLM-5.3-Flash PR #63), as Project Maya ships it; STRATA_PACK_TEMPLATE=1 takes the pack's own
+        tpl = ROOT / "serve/glm5_chat_template.jinja"
     if (cfg.get("arch") or "") == "deepseek41":
         from serve import dsml
         tpl, swapped = dsml.pick_template(tpl)
@@ -8518,7 +8529,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "glm5") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

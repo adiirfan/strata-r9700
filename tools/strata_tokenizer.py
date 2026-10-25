@@ -100,11 +100,28 @@ def _sequence_findall(patterns, text: str, keep_empty: bool = True) -> list[str]
     return pieces
 
 
+# The `glm4`/`glm5` pre-tokenizer (GLM-5.3-Flash), transcribed from llama-vocab.cpp L406-410 at the vendored pin
+# (LLAMA_VOCAB_PRE_TYPE_CHATGLM4), as Project Maya has it.  Against qwen35: digit runs of 1..3, letters `\p{L}+` and
+# punctuation `[^\s\p{L}\p{N}]` without `\p{M}` (a combining mark joins the punctuation after it).  And llama.cpp sets
+# ignore_merges for glm4/glm5: a pre-token piece that is a whole vocabulary token is emitted as it is (no merges), only
+# the others go through BPE.
+GLM_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None, pattern=None):
         self.tokens = tokens
         self.pre = pre
+        self.ignore_merges = pre in ("glm4", "glm5")   # (GLM_PATTERN above)
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -132,6 +149,9 @@ class Tokenizer:
             else:
                 self._re = regex.compile(pattern)
                 self._split = self._re.findall
+        elif self.ignore_merges:
+            self._re = regex.compile(GLM_PATTERN)
+            self._split = self._re.findall
         elif str(pre).startswith("deepseek"):
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
@@ -277,7 +297,9 @@ class Tokenizer:
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
-                for tok in self._bpe(mapped):
+                # ignore_merges: the whole-vocabulary lookup runs on the byte-mapped piece, as the vocabulary is stored
+                hit = self.ids.get(mapped) if self.ignore_merges else None
+                for tok in ([mapped] if hit is not None else self._bpe(mapped)):
                     i = self.ids.get(tok)
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)

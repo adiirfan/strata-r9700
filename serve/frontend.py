@@ -37,6 +37,10 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     client gets a 400 with the template's message instead of a dropped connection (#365)."""
 
 
+# Strata's thinking levels in GLM-5.x's words (its template: low, high, else max)
+GLM_EFFORT = {"low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
@@ -52,6 +56,9 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # GLM-5.x (as Project Maya renders it): the template knows reasoning_effort "low" and "high" only - anything
+        # else, an absent one included, is its "Max" - and it always opens <think> (it has no enable_thinking)
+        self.glm_effort = "reasoning_effort in ['low', 'high']" in self.source
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -62,8 +69,15 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
-        return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+        off = False
+        if self.glm_effort:
+            off = kwargs.pop("enable_thinking", True) is False
+            kwargs["reasoning_effort"] = "low" if off else GLM_EFFORT.get(kwargs.pop("reasoning_effort", None), "max")
+        out = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                   **kwargs)
+        if off and add_generation_prompt and out.endswith("<think>"):
+            out += "</think>"       # thinking off: the empty block the same template writes for a turn without reasoning
+        return out
 
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
@@ -147,7 +161,8 @@ def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
     global _NUMERIC_EFFORT
     EFFORT.clear()
-    EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
+    # (GLM-5.x names its levels as DeepSeek does - low, high, max - and ChatTemplate puts them in its template's words)
+    EFFORT.update(EFFORT_DEEPSEEK if family in ("deepseek41", "glm5") else _EFFORT_QWEN)
     _NUMERIC_EFFORT = family == "deepseek41"
 
 
@@ -781,6 +796,17 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
             if isinstance(name, str) and name:
                 return "named", name
     return "unknown", None
+
+
+def to_glm_force(force: str | None) -> str | None:
+    """forced_call's opening of a call in the Qwen form -> the same opening in GLM's (`<tool_call>NAME<arg_key>...`,
+    what FlintParser reads): the bare opening for "any tool", the opening and the name for a named one."""
+    if not force:
+        return force
+    marker = "<function="
+    at = force.find(marker)
+    name = force[at + len(marker):] if at >= 0 else ""
+    return CALL_START + (name[:-2] if name.endswith(">\n") else "")
 
 
 def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
