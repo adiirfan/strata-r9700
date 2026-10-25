@@ -7898,6 +7898,8 @@ struct Model::Impl {
     // sets it) - at least one expert, or not layer-major
     bool lm_begin(const Run& run) {
         static const char* env = std::getenv("DS4_LAYER_MAJOR");
+        if (o.verbose) std::fprintf(stderr, "ds4: layer-major check: %zu devices, %zu chunks, flow %d\n", devs.size(), run.T.size(),
+                                    chunks.empty() || chunks[0] == nullptr ? -1 : (int) chunks[0]->flow);
         if (devs.size() != 1 || run.T.size() < 2 || (env != nullptr && std::atoi(env) == 0)) return false;
         Chunk& c = *chunks[0];
         if (!c.flow) return false;
@@ -7918,6 +7920,10 @@ struct Model::Impl {
         for (int T : run.T) rows += T;
         const size_t hb = chunk_hand_bytes(), state_b = run.T.size() * hb;
         const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) g.nl;
+        if (o.verbose)
+            std::fprintf(stderr, "ds4: layer-major? %zu chunks, files read again %.1f GB a chunk, states moved %.1f GB, the largest layer's "
+                                 "file experts %.2f GB, RAM available %.1f GB\n", run.T.size(), file_b / 1e9, moved / 1e9, need / 1e9,
+                         ram_avail() / 1e9);
         if (need == 0 || (double) (run.T.size() - 1) * file_b <= moved) return false;
         size_t lc_bytes = need;
         if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
