@@ -1978,7 +1978,13 @@ struct Model::Impl {
             file_experts = exp_b - std::max(0.0, room - other_b) + (double) kRamMargin > (double) ram_avail();
         }
         const bool own_default = !(par || o.tp > 1);   // (the single-card default run the chunked path newly takes: chunks of 1024 - 8K prompt 370 tok/s on 4 x R9700, 214 at 8192; the threads / tp runs keep theirs)
-        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : own_default ? 1024 : file_experts ? kVlRows : 2048) : 0;
+        // (experts read in place on one card of 28 GB free or more: chunks of 1.5 kVlRows - a long prompt streams its
+        // CPU-lane experts once a chunk, so fewer chunks stream less, for some expert slots the larger buffers take; short
+        // prompts and the decode after them measured unchanged, and 2 kVlRows gave up too many slots)
+        bool big_card = devs.size() == 1;
+        for (const Dev& d : devs) big_card = big_card && d.free0 >= ((size_t) 28 << 30);
+        const int fe_chunk = big_card ? kVlRows * 3 / 2 : kVlRows;
+        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : own_default ? 1024 : file_experts ? fe_chunk : 2048) : 0;
         const char* dc = std::getenv("DS4_CHUNK");   // (tests: down to 16, a short prompt in several chunks)
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
@@ -6011,7 +6017,7 @@ struct Model::Impl {
                 list.push_back(h.second);
             }
             // DS4_SETTLE_ASYNC (4): read in the background, a few at a time, while the answer starts (0: the prompt waits
-            // for all of them, as before: ~7 s of a 4-8K prompt on a 4.5 GB/s disk)
+            // for all of them, as before)
             static const int warm_depth = (int) env_f("DS4_SETTLE_ASYNC", 4.0f);
             if (warm_depth > 0) {
                 store->warm_async(list, warm_depth);
