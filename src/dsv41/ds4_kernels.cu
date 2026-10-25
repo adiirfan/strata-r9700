@@ -2171,6 +2171,109 @@ void compress_win(const float* kv, const float* score, float* kv_state, float* s
     compress_kernel<<<1, 512, 0, s>>>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
 }
 
+// ---------------------------------------------------------------- the indexer on gfx12 matrix cores (no candidates)
+// A block: 16 queries x kIxKeys keys, 8 waves of 4 heads each (heads 4 w ..): each wave holds its heads' query rows as
+// BF16 WMMA A fragments for the whole block (loaded once), takes the keys 16 at a time as B fragments (the packed FP4 values
+// exact in BF16), S_h = Q_h . K^T in FP32, relu, times the head's weight, summed over its heads; the waves' sums are added
+// in a fixed order in shared memory.  The queries are rounded to BF16 (the keys are exact): the scores only pick the top-k,
+// and the sum's order differs from index_score_kernel's.  Fragments as sparse_attn_wmma_kernel's.
+constexpr int kIxWaves = 8, kIxHw = 4, kIxThreads = 32 * kIxWaves, kIxKeys = 256;
+template <int KF>
+__global__ void __launch_bounds__(kIxThreads) index_score_wmma_kernel(const float* __restrict__ q, const float* __restrict__ w,
+                                                                      const uint8_t* __restrict__ kc, int heads, int n, int T,
+                                                                      Rows lim, float* __restrict__ out, long long out_stride) {
+#if DS4_ATTN_W12
+    constexpr int HD = 128;
+    const int t0 = blockIdx.y * 16, kb0 = blockIdx.x * kIxKeys;
+    const int tid = threadIdx.x, lane = tid & 31, wv = tid >> 5, lo = lane & 15, hi = lane >> 4;
+    __shared__ float red[kIxWaves][16][17];
+    // this wave's heads: their query rows (token t0 + lo, dims 16 ks + 8 hi + j) as A fragments, and their weights for the
+    // C rows this lane holds (tokens t0 + 8 hi + i)
+    aw_bf8 qa[kIxHw][8];
+    float wr[kIxHw][8];
+    const int tq = min(t0 + lo, T - 1);
+#pragma unroll
+    for (int hh = 0; hh < kIxHw; ++hh) {
+        const int h = kIxHw * wv + hh;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                qa[hh][ks][j] = h < heads ? (__bf16) q[((size_t) tq * heads + h) * HD + 16 * ks + 8 * hi + j] : (__bf16) 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int tr = min(t0 + 8 * hi + i, T - 1);
+            wr[hh][i] = h < heads ? w[(size_t) tr * 64 + h] : 0.0f;
+        }
+    }
+    const size_t krow = kv_row_bytes(KF, HD);
+    const int kend = min(kb0 + kIxKeys, n);
+    for (int kt = kb0; kt < kend; kt += 16) {
+        const int key = min(kt + lo, n - 1);
+        const uint8_t* kr = kc + (size_t) key * krow;
+        aw_bf8 kb[8];
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int d0 = 16 * ks + 8 * hi;
+            if (KF == kKvFp4p) {
+                const uint32_t cw = *(const uint32_t*) (kr + d0 / 2);
+                const float sc = ue8m0_val(kr[HD / 2 + d0 / 32]);
+#pragma unroll
+                for (int x = 0; x < 8; ++x) kb[ks][x] = (__bf16) (e2m1_val14(cw >> (4 * x)) * 16384.0f * sc);
+            } else {
+                kb[ks] = __builtin_bit_cast(aw_bf8, *(const uint4*) (kr + d0 * 2));
+            }
+        }
+        aw_f8 acc = {};
+#pragma unroll
+        for (int hh = 0; hh < kIxHw; ++hh) {
+            aw_f8 sh = {};
+#pragma unroll
+            for (int ks = 0; ks < 8; ++ks) sh = aw_mma(qa[hh][ks], kb[ks], sh);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] += fmaxf(sh[i], 0.0f) * wr[hh][i];
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) red[wv][8 * hi + i][lo] = acc[i];
+        __syncthreads();
+        {
+            const int r = tid >> 4, c = tid & 15, t = t0 + r, kk = kt + c;
+            if (t < T && kk < kend) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int ww = 0; ww < kIxWaves; ++ww) sum += red[ww][r][c];
+                int ln, lk;
+                rows_at(lim, t, ln, lk);
+                out[(long long) t * out_stride + kk] = kk < ln ? sum : -INFINITY;
+            }
+        }
+        __syncthreads();
+    }
+#else
+    (void) q; (void) w; (void) kc; (void) heads; (void) n; (void) T; (void) lim; (void) out; (void) out_stride;
+    __builtin_trap();
+#endif
+}
+static bool attn_wmma_ok();
+static bool ix_wmma_ok() {   // (as the attention's, gfx1200 / gfx1201; DS4_IX_WMMA=0: the scalar kernel)
+    static const bool env_on = [] {
+        const char* v = std::getenv("DS4_IX_WMMA");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!env_on) return false;
+    static const bool same = [] {   // (attn_wmma_ok answers for the card; DS4_ATTN_WMMA=0 must not switch this one off)
+        const char* v = std::getenv("DS4_ATTN_WMMA");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!same) {
+        int dev = 0;
+        cudaDeviceProp p{};
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+               (std::strncmp(p.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(p.gcnArchName, "gfx1201", 7) == 0);
+    }
+    return attn_wmma_ok();
+}
+
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
                  int kfmt) {
@@ -2179,6 +2282,14 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
         return;
     }
     if (n <= 0) return;
+    if (cand == nullptr && heads <= kIxWaves * kIxHw && ix_wmma_ok()) {   // (DS4_IX_WMMA=0: the scalar kernel)
+        const dim3 g2(cdiv(n, kIxKeys), cdiv(T, 16));
+        if (kfmt == kKvFp4p)
+            index_score_wmma_kernel<kKvFp4p><<<g2, kIxThreads, 0, s>>>(q, w, (const uint8_t*) k, heads, n, T, lim, out, out_stride);
+        else
+            index_score_wmma_kernel<kKvBf16><<<g2, kIxThreads, 0, s>>>(q, w, (const uint8_t*) k, heads, n, T, lim, out, out_stride);
+        return;
+    }
     const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     const dim3 grid(cdiv(n, kThreads), T);
     if (kfmt == kKvFp4p)
