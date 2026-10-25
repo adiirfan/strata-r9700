@@ -596,6 +596,7 @@ struct Chunk {
     int spec_k = -1, spec_il = -1, n_spec = 0;   // the likely items queued last: (chunk, layer), how many, from where
     size_t spec_begin = 0;
     std::vector<int> fl_layers, fl_T;        // the device's trunk layers in order; the run's chunk sizes
+    std::vector<int> rest_order;             // the last flow_spec's layer: its other CPU-lane experts in virtual-slot order
     int fl_yoco = -1, fl_cut_k = 0, fl_cut_r = 0;   // Run::yoco / cut_k / cut_r: what a layer's chunk streams for
     int bc_n = 0, bc_w = 0;                  // a batch's compacted bounds: bc_n regions of bc_w, by batch count
     int *bc_pin = nullptr, *bc_dev = nullptr;
@@ -3303,8 +3304,15 @@ struct Model::Impl {
         // 21 of 1568, the early reads 9-12% faster there)
         static const double waste = std::getenv("DS4_SPEC_WASTE") ? std::atof(std::getenv("DS4_SPEC_WASTE")) : 0.2;
         const bool early = c.it_spec < 2u * (uint64_t) c.ring_n || (double) c.it_spec_unused <= waste * (double) c.it_spec;
+        // DS4_SPEC_DISK (1): only the ones read from the disk - a RAM-tier or store expert is a memcpy once the layer routed,
+        // and the early reads' room (staging + ring) is better spent on the disk's
+        static const bool spec_disk = std::getenv("DS4_SPEC_DISK") == nullptr || std::atoi(std::getenv("DS4_SPEC_DISK")) != 0;
+        auto in_ram = [&](int e) {
+            return (!l.ram.empty() && l.ram[(size_t) e] >= 0) || (store && l.nm == 1 && store->find(l.il, e) >= 0);
+        };
         for (int e : l.host_list) {
             if (!early) break;
+            if (spec_disk && in_ram(e)) continue;
             const double p = sum > 0 ? pr[e] / sum : 0.0;
             const double q = p >= 1.0 ? 1.0 : 1.0 - std::exp(picks * std::log1p(-p));
             if (q >= spec_q && spec_q <= 1.0) cand.push_back({q, e});
@@ -3319,8 +3327,20 @@ struct Model::Impl {
             vs[x.second] = l.n_slots + j++;
             is[(size_t) x.second] = 1;
         }
-        for (int e : l.host_list)
-            if (!is[(size_t) e]) vs[e] = l.n_slots + j++;
+        // the rest after them, in index order (DS4_RAM_FIRST=1: the ones RAM holds first, =2: the disk's first - each group in
+        // index order; both measured slower on an 8K prompt, the disk's reads waiting behind the RAM ones' copies or the
+        // compute behind the disk's)
+        static const int ram_first = std::getenv("DS4_RAM_FIRST") ? std::atoi(std::getenv("DS4_RAM_FIRST")) : 0;
+        c.rest_order.clear();
+        if (ram_first != 0 && l.nm == 1) {
+            for (int e : l.host_list)
+                if (!is[(size_t) e] && in_ram(e) == (ram_first == 1)) c.rest_order.push_back(e);
+            for (int e : l.host_list)
+                if (!is[(size_t) e] && in_ram(e) != (ram_first == 1)) c.rest_order.push_back(e);
+        } else
+            for (int e : l.host_list)
+                if (!is[(size_t) e]) c.rest_order.push_back(e);
+        for (int e : c.rest_order) vs[e] = l.n_slots + j++;
         for (const auto& x : cand) flow_push(c, l, mi, k, x.second, vs[x.second]);
         c.n_spec = (int) cand.size();
         c.it_spec += cand.size();
@@ -3334,7 +3354,7 @@ struct Model::Impl {
             const int v = fit(c, i).v;
             if (b[(size_t) v + 1] == b[(size_t) v]) ++c.it_spec_unused;
         }
-        for (int e : l.host_list) {   // (index order: their virtual slots ascending)
+        for (int e : c.rest_order) {   // (their virtual slots ascending)
             const int v = vs[e];
             if (v >= l.n_slots + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
         }
