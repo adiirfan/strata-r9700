@@ -1023,6 +1023,7 @@ struct Model::Impl {
     const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
                 c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
     const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
+    std::atomic<int64_t> swaps_from_store{0};   // (moves into VRAM that copied the RAM store's blob instead of reading the file)
     // the RAM tier (a GGUF's in-place experts, as GLM's: the hottest in VRAM, the next hottest here, the coldest in the
     // files): RAM slots of one expert blob each, filled at load with the hottest experts VRAM does not hold, so the
     // CPU lane reads them from RAM; between windows (cache_tick) a hotter expert from the files takes the place of the
@@ -2693,6 +2694,11 @@ struct Model::Impl {
                     if (fl)   // (each part read unbuffered from its offset rounded down: a page more each)
                         cp->stage_stride = std::max(cp->stage_stride, flow_stride());
                     cp->S = cp->ring_n;
+                    // DS4_STAGE_MB (the flow): pinned staging beyond the ring's, so the reads run further ahead of the compute
+                    // than the ring holds - an item waits in staging for its ring slot, and the early reads a layer queues
+                    // (at most staging + ring) cover more of its picks
+                    if (fl && std::getenv("DS4_STAGE_MB") != nullptr)
+                        cp->S = std::max(cp->ring_n, (int) (((size_t) std::atoi(std::getenv("DS4_STAGE_MB")) << 20) / cp->stage_stride));
                     if (!halloc(cp->stage, (size_t) cp->S * cp->stage_stride, err)) return false;
                     cp->readers = std::make_unique<Pool>(n_readers - 1, std::vector<int>{}, 50);
                     if (!fl) continue;
@@ -5896,8 +5902,11 @@ struct Model::Impl {
     void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
-        bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
-                                                                                          // this swap's switch)
+        // (a copy holds its slot till this swap's switch; the RAM store's copy when it has one - the file's pages are on the
+        // disk as often as not after a prompt, a read each where the store's is a memcpy)
+        const bool from_store = !copy_mode && store && l.nm == 1 && store->copy_out(l.il, sw.in, sw_a, l.blob);
+        if (from_store) swaps_from_store.fetch_add(1, std::memory_order_relaxed);
+        bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : from_store || read_mx_file(l, sw.in, sw_a);
         for (int m = 0; m < l.nm && ok; ++m) {
             const Layer& x = member(l, m);
             cudaSetDevice(devs[(size_t) x.dev].id);
@@ -5953,11 +5962,10 @@ struct Model::Impl {
     // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
     void cache_settle() {
         if (!o.expert_cache || cache_ths.empty()) return;
-        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
-        if (budget <= 0.0) return;
+        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);   // (0: no VRAM rounds, the RAM store still refilled)
         const double t0 = now_ms();
         const int64_t s0 = st.swaps;
-        while (now_ms() - t0 < budget) {
+        while (budget > 0.0 && now_ms() - t0 < budget) {
             for (Layer& l : L) {
                 if (l.mtp || l.spare_vram < 0 || l.swap_pending) continue;
                 l.cpu_hits.clear();
@@ -5994,9 +6002,9 @@ struct Model::Impl {
                 if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts read after the prompt (%.0f ms)\n", n, now_ms() - ts);
             }
         }
-        if (o.verbose && st.swaps > s0)
-            std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
-                         now_ms() - t0);
+        if ((o.verbose || std::getenv("DS4_WARM_REPORT")) && st.swaps > s0)
+            std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms), %lld from the RAM store in all\n",
+                         (long long) (st.swaps - s0), now_ms() - t0, (long long) swaps_from_store.load());
     }
     void cache_tick(int T) {
         cache_tick_swaps(T);

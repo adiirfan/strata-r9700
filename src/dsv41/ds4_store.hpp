@@ -134,6 +134,25 @@ public:
     }
     const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + geo_[(size_t) slots_[(size_t) slot].layer].tr[r]; }
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
+    /// (layer, e)'s blob copied to dst (n bytes) if it is here and ready - pinned for the copy, its age left alone; false
+    /// otherwise (nothing read)
+    bool copy_out(int layer, int e, uint8_t* dst, size_t n) {
+        if (layer < 0 || layer >= (int) where_.size() || e < 0 || e >= (int) where_[(size_t) layer].size()) return false;
+        int s;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            s = where_[(size_t) layer][(size_t) e];
+            if (s < 0) return false;
+            Slot& sp = slots_[(size_t) s];
+            try_ready(sp);
+            if (sp.state.load(std::memory_order_acquire) != kReady || sp.layer != layer || sp.expert != e) return false;
+            sp.pin++;
+        }
+        std::memcpy(dst, slots_[(size_t) s].base, n);
+        std::lock_guard<std::mutex> lk(mu_);
+        slots_[(size_t) s].pin--;
+        return true;
+    }
     /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
     unsigned long long dev_blob(int slot) const {
         const size_t c = (size_t) slot / kChunk;
@@ -272,21 +291,27 @@ public:
         warm_th_ = std::thread([this, todo = std::move(todo), depth, base] {
             const auto t0 = std::chrono::steady_clock::now();
             size_t next = 0, nread = 0;
+            std::vector<int> mine;   // (its own reads under way: the only slots it looks at)
             while (!warm_quit_.load(std::memory_order_acquire)) {
                 bool loading_left = false;
                 {
                     std::lock_guard<std::mutex> lk(mu_);
-                    int in_flight = 0;
-                    for (size_t j = 0; j < nalloc_; ++j) {
-                        Slot& sp = slots_[j];
-                        if (sp.state.load(std::memory_order_acquire) != kLoading) continue;
-                        if (sp.left.load(std::memory_order_acquire) == 0) {
+                    for (size_t j = 0; j < mine.size();) {
+                        Slot& sp = slots_[(size_t) mine[j]];
+                        if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
                             try_ready(sp);
                             if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
                         }
-                        if (sp.state.load(std::memory_order_acquire) == kLoading) ++in_flight;
+                        if (sp.state.load(std::memory_order_acquire) == kLoading) ++j;
+                        else {
+                            mine[j] = mine.back();
+                            mine.pop_back();
+                        }
                     }
-                    while (in_flight < depth && next < todo.size()) {
+                    int in_flight = (int) mine.size();
+                    // (none started while a token's reads are queued or being read: those wait on nothing of ours but the
+                    // reads already under way)
+                    while (in_flight < depth && next < todo.size() && io_->hi_busy() == 0) {
                         const int layer = todo[next].first, e = todo[next].second;
                         ++next;
                         if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
@@ -298,13 +323,14 @@ public:
                         }
                         slots_[(size_t) sl].prefetch = false;   // (warm, not a guess)
                         slots_[(size_t) sl].tick = base + todo.size() - (next - 1);
+                        mine.push_back(sl);
                         ++in_flight;
                         ++nread;
                     }
                     loading_left = in_flight > 0;
                 }
                 if (next >= todo.size() && !loading_left) break;
-                io_->wait_any(20);
+                io_->wait_any(2000);
             }
             if (std::getenv("DS4_WARM_REPORT"))
                 std::fprintf(stderr, "ds4: RAM store: background refill %s: %zu read of %zu listed in %.0f ms\n",

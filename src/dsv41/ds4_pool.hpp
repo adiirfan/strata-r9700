@@ -164,6 +164,7 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             for (int i = 0; i < n; ++i) (low ? ql_ : q_).push_back(jobs[i]);
         }
+        if (!low) hi_busy_.fetch_add(n, std::memory_order_acq_rel);
         if (n == 1) cv_.notify_one();
         else cv_.notify_all();
     }
@@ -173,6 +174,8 @@ public:
         done_cv_.wait_for(lk, std::chrono::microseconds(us), [&] { return done_ != seen; });
     }
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
+    /// first-queue jobs queued or being read (what a background reader holds back for)
+    int hi_busy() const { return hi_busy_.load(std::memory_order_acquire); }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }
 
@@ -180,10 +183,12 @@ private:
     void loop() {
         for (;;) {
             Job j;
+            bool hi = false;
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 cv_.wait(lk, [&] { return quit_ || !q_.empty() || !ql_.empty(); });
                 if (quit_ && q_.empty() && ql_.empty()) return;
+                hi = !q_.empty();
                 std::deque<Job>& qq = q_.empty() ? ql_ : q_;
                 j = qq.front();
                 qq.pop_front();
@@ -191,6 +196,7 @@ private:
             if (j.cancel != nullptr && j.cancel->load(std::memory_order_acquire)) {   // (dropped unread)
                 if (j.bad != nullptr) j.bad->store(true, std::memory_order_release);
                 if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
+                if (hi) hi_busy_.fetch_sub(1, std::memory_order_acq_rel);
                 {
                     std::lock_guard<std::mutex> lk(done_mu_);
                     ++done_;
@@ -218,6 +224,7 @@ private:
                                std::memory_order_relaxed);
             if (!ok && j.bad != nullptr) j.bad->store(true, std::memory_order_release);
             if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
+            if (hi) hi_busy_.fetch_sub(1, std::memory_order_acq_rel);
             {
                 std::lock_guard<std::mutex> lk(done_mu_);
                 ++done_;
@@ -232,6 +239,7 @@ private:
     uint64_t done_ = 0;
     bool quit_ = false;
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
+    std::atomic<int> hi_busy_{0};
 };
 
 }  // namespace strata::ds4
