@@ -309,9 +309,11 @@ int main(int argc, char** argv) {
         if (err.empty()) {
             const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
-            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
+            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token.  A text
+            // model without M-RoPE (GLM-5.3: its image tokens take no positions) has no grid: one row (as Project Maya)
             const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
+            const bool grid = mtmd_decode_use_mrope(ctx);
+            const int nx = grid ? (int) last.x + 1 : n, ny = grid ? (int) last.y + 1 : 1;
             if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
             // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
             if (err.empty() && max_tokens > 0 && n > max_tokens + max_tokens / 8)
