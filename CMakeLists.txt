@@ -353,6 +353,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core strata_kernels)
 
+  # NVIDIA Nemotron 3.5 Bolt's language model (src/nemotron): its own program, sharing the kernels
+  add_executable(strata-nemo src/nemotron/nemo_main.cu)
+  target_include_directories(strata-nemo PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-nemo PRIVATE strata_kernels strata_prefill ${_strata_gpu_runtime_target})
+
+  # Recursive Flint (src/flint): its own program, read straight from the Q4_1 GGUF
+  add_executable(strata-flint src/flint/flint_main.cu src/flint/flint_cpu.cpp)
+  set_source_files_properties(src/flint/flint_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+  find_package(Threads REQUIRED)
+  target_include_directories(strata-flint PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-flint PRIVATE strata_kernels strata_prefill ${_strata_gpu_runtime_target} Threads::Threads)
+
+  # Ling-3.0-flash-VL (src/ling): its own program on the GGUF's formats, experts split card / CPU as Flint's hybrid mode
+  add_executable(strata-ling src/ling/ling_main.cu src/flint/flint_cpu.cpp)
+  set_source_files_properties(src/flint/flint_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+  target_include_directories(strata-ling PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-ling PRIVATE strata_kernels ${_strata_gpu_runtime_target} Threads::Threads)
+
   add_executable(strata-concurrent src/core/concurrent_main.cpp)
   target_include_directories(strata-concurrent PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-concurrent PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})

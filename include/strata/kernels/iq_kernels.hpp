@@ -28,6 +28,12 @@ void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_i
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale = nullptr);
+/// The same to BF16 (round to nearest even).
+void iq_dequant_bf16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
+/// IQ2_XXS rows (K values each, K a multiple of 256) to E4M3 at one scale per row (the row's largest magnitude / 448,
+/// into rscale), each value rounded to BF16 first: the same bytes as iq_dequant_bf16 followed by a per-row E4M3
+/// conversion, without the BF16 copy.
+void iq2xxs_e4m3_rows(const void* w, int rows, int K, uint8_t* w8, float* rscale, void* stream);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
 /// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
 /// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
@@ -128,5 +134,51 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream);
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
+
+/// Routed experts in one launch: y[j] = W_{idx[j]} . x_j for j < n_slots, W_e = table[e] (device arrays),
+/// x_j = x_q8_1 + (j / x_div) * x_stride_blocks q8_1 blocks. IQ2_XXS only so far.
+void iq_mmvq_gather(int ggml_type, const unsigned long long* table, const int32_t* idx, int n_slots,
+                    const void* x_q8_1, int x_stride_blocks, int x_div, float* y, int n_in, int n_out, void* stream);
+// IQ2_XXS only, from FP32 inputs (row j / x_div for slot j, n_in <= 5376): the inputs go to FP16 with a power-of-two
+// scale per 32 in each block, the products are FP16 pairs into FP32. relu_in / relu_out: max(v, 0)^2 of the inputs /
+// outputs. y is (n_slots, n_out).
+void iq2_gather_f16(const unsigned long long* table, const int32_t* idx, int n_slots, const float* x, int x_div, bool relu_in,
+                    bool relu_out, float* y, int n_in, int n_out, void* stream);
+// the same for two jobs in one launch (b may be null): each job is n_slots matrices table[idx[j]] of n_out x n_in
+struct Iq2F16Job {
+    const unsigned long long* table;
+    const int32_t* idx;
+    int n_slots;
+    const float* x;
+    int x_div;
+    float* y;
+    int n_in, n_out;
+};
+void iq2_gather_f16(const Iq2F16Job& a, const Iq2F16Job* b, bool relu_in, bool relu_out, void* stream);
+
+/// Grouped routed experts: group g (g < *n_groups, at most max_groups launched) is expert g_exp[g] applied to
+/// g_cnt[g] <= 16 inputs x_q8_1 + g_xi[g*16+m] * x_stride_blocks, writing y row block g_slot[g*16+m]. IQ2_XXS only.
+void iq_mmvq_grouped(int ggml_type, const unsigned long long* table, const int32_t* n_groups, int max_groups,
+                     const int32_t* g_exp, const int32_t* g_cnt, const int32_t* g_xi, const int32_t* g_slot,
+                     const void* x_q8_1, int x_stride_blocks, float* y, int n_in, int n_out, void* stream);
+
+// max(x, 0)^2 quantized to q8_1 rows: bitwise k_relu2 then quantize_q8_1_rows, one launch (n_cols % 32 == 0)
+void relu2_quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream);
+
+// y[c][row] = W[row] . x[c] for c < ncols, rows_per_warp (2 or 4) rows per warp sharing each activation load;
+// bitwise equal to iq_mmvq. IQ2_XXS only.
+void iq_mmvq_rows(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int rows_per_warp,
+                  void* stream);
+
+/// Grouped IQ2_XXS expert products on the FP16 matrix cores (gfx12 only). X is in the scaled FP16 form of
+/// moe_x16_rows (xh: FP16 values / their scale, K a row; xs: one power-of-two scale per 128 values); for each expert e,
+/// rows bounds[e] .. bounds[e+1] of X (row src[r] if src) times its [n_out, K] matrix (at w_all + e * expert_bytes)
+/// into y (fp32, row stride ldy), or, with yh, relu(.)^2 of it into the same scaled FP16 form (yh, ys; row stride ldy).
+/// tiles (2 * moe_wmma_max_tiles ints) and n_tiles are the call's work list, built from bounds when make_tiles.
+int moe_wmma_max_tiles(int64_t rows, int n_exp);
+void moe_x16_rows(const float* x, int64_t n, uint16_t* xh, float* xs, void* stream);
+void moe_wmma_iq2xxs(const void* w_all, size_t expert_bytes, int n_exp, int n_out, int K, const uint16_t* xh, const float* xs,
+                     const int32_t* src, const int32_t* bounds, int64_t rows, int32_t* tiles, int32_t* n_tiles, bool make_tiles,
+                     float* y, uint16_t* yh, float* ys, int ldy, void* stream);
 
 }  // namespace strata::kernels

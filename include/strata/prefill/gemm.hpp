@@ -37,8 +37,9 @@ public:
     /// STRATA_BF16_TC=1), Pascal widens both to fp32 (cublasSgemm); see gemm.cu.
     /// `x_f16`: X holds, instead of BF16, the FP16 values the Turing tensor-core path would convert it to
     /// (prefill's xn16 with its f16img writers): that path skips the conversion; any other converts back.
+    /// `scale` multiplies the product (the GEMM's alpha).
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-              float beta = 0.0f, int64_t ldx = 0, bool x_f16 = false);
+              float beta = 0.0f, int64_t ldx = 0, bool x_f16 = false, float scale = 1.0f);
     /// true when bf16() runs its products through FP16 tensor cores here (Turing, STRATA_BF16_TC): where X may be FP16
     bool bf16_converts_x() const;
 
@@ -46,6 +47,10 @@ public:
     /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
     /// shape (so the caller falls back to bf16(), with the same ldx).
     bool bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K);
+
+    /// FP8 (E4M3) product of operands already converted: Y[T, N] (fp32, row stride ldy) = X8[T, K] . W8[N, K]^T, each
+    /// output column n times alpha[n] (a device vector). false (nothing launched) where hipBLASLt has no FP8 plan.
+    bool fp8(const uint8_t* X8, const uint8_t* W8, const float* alpha, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
 
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
@@ -107,6 +112,17 @@ private:
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
+    /// STRATA_PF_FP8=1 (HIP, hipBLASLt): native() as an FP8 (E4M3) product - the weight per row, the activations per
+    /// slice, both scales applied by hipBLASLt's alpha vector; false (nothing launched) where it does not apply.
+    bool native_fp8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                    int64_t ldy, float beta);
+    uint8_t* fp8_w_ = nullptr;      // the weight in E4M3
+    int64_t fp8_w_bytes_ = 0;
+    float* fp8_vec_ = nullptr;      // per weight row: its scale, then the product's alpha (row scale x activation scale)
+    int64_t fp8_vec_rows_ = 0;
+    uint32_t* fp8_amax_ = nullptr;  // the activation slice's largest |x| (float bits)
+    bool fp8_failed_ = false;
+    void* fp8_cache_ = nullptr;     // descriptors and algorithm per shape
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };

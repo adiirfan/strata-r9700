@@ -395,7 +395,7 @@ int hipblaslt_solution_for(void* opaque_state, strata::prefill::hipblaslt::Input
 
 bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType type, const uint16_t* x,
                    const uint16_t* w, float* y, int64_t t, int64_t n, int64_t k, int64_t ldy, float beta,
-                   void* stream, int64_t ldx = 0) {
+                   void* stream, int64_t ldx = 0, float alpha = 1.0f) {
     auto* state = static_cast<HipLtState*>(opaque_state);
     if (!state || t <= 0 || n <= 0 || k <= 0 || t > INT_MAX || n > INT_MAX || k > INT_MAX || ldy > INT_MAX ||
         ldy < n) {
@@ -420,7 +420,6 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     HipLtDescriptors desc;
     const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
     if (!desc.init(input_type, (int) t, (int) n, (int) k, (int) ldy, (int) ldx)) return false;
-    const float alpha = 1.0f;
     const hipblasStatus_t status = hipblasLtMatmul(state->handle, desc.op, &alpha, w, desc.a, x, desc.b, &beta, y,
                                                    desc.c, y, desc.c, &resolved.algo, state->workspace,
                                                    state->workspace_bytes, (hipStream_t) stream);
@@ -626,8 +625,183 @@ const uint16_t* Gemm::unpad_x(const uint16_t* X, int64_t T, int64_t K, int64_t l
     }
     return unpadded_x_;
 }
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+// ---- STRATA_PF_FP8: native() as an FP8 product (see Gemm::native_fp8)
+}  // namespace strata::prefill
+#include <hip/hip_fp8.h>
+#include <map>
+namespace strata::prefill {
+namespace {
+constexpr float kE4M3Max = 448.0f;
+__device__ __forceinline__ uint8_t to_e4m3(float v) {
+    return (uint8_t) __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
+}
+__device__ __forceinline__ float block_max256(float m) {
+    __shared__ float red[256];
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    return red[0];
+}
+// one block per weight row: scale = max |w| / 448, the row in E4M3 at that scale
+__global__ void __launch_bounds__(256) fp8_rows_kernel(const uint16_t* __restrict__ w16, int64_t K, uint8_t* __restrict__ w8,
+                                                       float* __restrict__ scale) {
+    const int64_t r = blockIdx.x;
+    const __half* row = reinterpret_cast<const __half*>(w16) + r * K;
+    float m = 0.0f;
+    for (int64_t i = threadIdx.x; i < K; i += 256) m = fmaxf(m, fabsf(__half2float(row[i])));
+    m = block_max256(m);
+    const float sc = m > 0.0f ? m / kE4M3Max : 1.0f, inv = 1.0f / sc;
+    for (int64_t i = threadIdx.x; i < K; i += 256) w8[r * K + i] = to_e4m3(__half2float(row[i]) * inv);
+    if (threadIdx.x == 0) scale[r] = sc;
+}
+// the largest |x| of n FP16 values into *amax (float bits: non-negative floats order as unsigned ints)
+__global__ void __launch_bounds__(256) fp8_amax_kernel(const uint16_t* __restrict__ x16, int64_t n, uint32_t* __restrict__ amax) {
+    const __half* x = reinterpret_cast<const __half*>(x16);
+    float m = 0.0f;
+    for (int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x; i < n; i += (int64_t) gridDim.x * 256)
+        m = fmaxf(m, fabsf(__half2float(x[i])));
+    m = block_max256(m);
+    if (threadIdx.x == 0 && m > 0.0f) atomicMax(amax, __float_as_uint(m));
+}
+__global__ void __launch_bounds__(256) fp8_act_kernel(const uint16_t* __restrict__ x16, int64_t n, const uint32_t* __restrict__ amax,
+                                                      uint8_t* __restrict__ x8) {
+    const __half* x = reinterpret_cast<const __half*>(x16);
+    const float m = __uint_as_float(*amax), inv = m > 0.0f ? kE4M3Max / m : 1.0f;
+    for (int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x; i < n; i += (int64_t) gridDim.x * 256)
+        x8[i] = to_e4m3(__half2float(x[i]) * inv);
+}
+__global__ void fp8_alpha_kernel(const float* __restrict__ wscale, int64_t N, const uint32_t* __restrict__ amax,
+                                 float* __restrict__ alpha) {
+    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
+    const float m = __uint_as_float(*amax), xs = m > 0.0f ? m / kE4M3Max : 1.0f;
+    if (i < N) alpha[i] = wscale[i] * xs;
+}
+struct Fp8Key {
+    int t, n, k, ldy;
+    uint32_t beta_bits;
+    bool operator<(const Fp8Key& o) const { return std::tie(t, n, k, ldy, beta_bits) < std::tie(o.t, o.n, o.k, o.ldy, o.beta_bits); }
+};
+// the algorithm is chosen once per bucket of rows (the slice rounded up to 1024) and per (n, k, ldy, beta): asking
+// hipBLASLt for every request's own row count loaded a new solution's code on most requests (1.6-3.0K tok/s spread)
+struct Fp8Algo {
+    bool ok = false;
+    hipblasLtMatmulAlgo_t algo{};
+};
+struct Fp8Plan {
+    bool ok = false;
+    hipblasLtMatmulDesc_t op = nullptr;
+    hipblasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+    hipblasLtMatmulAlgo_t algo{};
+};
+struct Fp8Cache {
+    std::map<Fp8Key, Fp8Plan> plans;
+    std::map<Fp8Key, Fp8Algo> algos;   // t = the bucket
+    ~Fp8Cache() {
+        for (auto& [k, p] : plans) {
+            if (p.op) hipblasLtMatmulDescDestroy(p.op);
+            if (p.a) hipblasLtMatrixLayoutDestroy(p.a);
+            if (p.b) hipblasLtMatrixLayoutDestroy(p.b);
+            if (p.c) hipblasLtMatrixLayoutDestroy(p.c);
+        }
+    }
+};
+// the descriptors and hipBLASLt's first heuristic answer for one shape (Y[t, n] fp32 = X8[t, k] . W8[n, k]^T, alpha
+// per row of W, beta on the host)
+const Fp8Plan& fp8_plan(Fp8Cache& cache, HipLtState& st, int t, int n, int k, int ldy, float beta) {
+    uint32_t bb = 0;
+    std::memcpy(&bb, &beta, sizeof bb);
+    Fp8Plan& p = cache.plans[Fp8Key{t, n, k, ldy, bb}];
+    if (p.op != nullptr) return p;
+    const hipblasOperation_t ta = HIPBLAS_OP_T, tb = HIPBLAS_OP_N;
+    const hipblasLtPointerMode_t pm = HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST;
+    if (hipblasLtMatmulDescCreate(&p.op, HIPBLAS_COMPUTE_32F, HIP_R_32F) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_POINTER_MODE, &pm, sizeof pm) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&p.a, HIP_R_8F_E4M3, k, n, k) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&p.b, HIP_R_8F_E4M3, k, t, k) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, n, t, ldy) != HIPBLAS_STATUS_SUCCESS)
+        return p;
+    const int bucket = (t + 1023) / 1024 * 1024;
+    Fp8Algo& fa = cache.algos[Fp8Key{bucket, n, k, ldy, bb}];
+    if (!fa.ok) {
+        // the tuning table's solution for this shape first (f8 rows: measured fastest of all the library's FP8
+        // solutions at that bucket), checked for this t below like the heuristic's
+        // debug: STRATA_FP8_SOL="n:k:solution,..." overrides the table
+        int forced = -1;
+        if (const char* e = std::getenv("STRATA_FP8_SOL")) {
+            for (const char* q = e; *q;) {
+                int fn = 0, fk = 0, fs = 0;
+                if (std::sscanf(q, "%d:%d:%d", &fn, &fk, &fs) == 3 && fn == n && fk == k) forced = fs;
+                const char* c = std::strchr(q, ',');
+                if (!c) break;
+                q = c + 1;
+            }
+        }
+        const auto* row = st.table.closest(strata::prefill::hipblaslt::InputType::f8, n, k, ldy, bucket);
+        if (forced >= 0 || row) {
+            std::vector<int> ids{forced >= 0 ? forced : row->solution_id};
+            std::vector<hipblasLtMatmulHeuristicResult_t> cand;
+            if (hipblaslt_ext::getAlgosFromIndex(st.handle, ids, cand) == HIPBLAS_STATUS_SUCCESS && !cand.empty() &&
+                cand.front().state == HIPBLAS_STATUS_SUCCESS && hipblaslt_ext::getIndexFromAlgo(cand.front().algo) == ids[0]) {
+                size_t need = 0;
+                const float one = 1.0f;
+                hipblasLtMatmulAlgo_t algo = cand.front().algo;
+                if (hipblaslt_ext::matmulIsAlgoSupported(st.handle, p.op, &one, p.a, p.b, &beta, p.c, p.c, algo, need) ==
+                        HIPBLAS_STATUS_SUCCESS && need <= st.workspace_bytes) {
+                    fa.algo = algo;
+                    fa.ok = true;
+                }
+            }
+        }
+    }
+    if (!fa.ok) {
+        // asked at the bucket's own size (layouts of `bucket` columns), then checked for this t below
+        hipblasLtMatrixLayout_t bb_l = nullptr, bc_l = nullptr;
+        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtMatmulHeuristicResult_t res[4];
+        int got = 0;
+        const uint64_t ws = st.workspace_bytes;
+        if (hipblasLtMatrixLayoutCreate(&bb_l, HIP_R_8F_E4M3, k, bucket, k) == HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatrixLayoutCreate(&bc_l, HIP_R_32F, n, bucket, std::max(ldy, n)) == HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof ws) == HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulAlgoGetHeuristic(st.handle, p.op, p.a, bb_l, bc_l, bc_l, pref, 4, res, &got) == HIPBLAS_STATUS_SUCCESS && got > 0) {
+            fa.algo = res[0].algo;
+            fa.ok = true;
+        }
+        if (pref) hipblasLtMatmulPreferenceDestroy(pref);
+        if (bb_l) hipblasLtMatrixLayoutDestroy(bb_l);
+        if (bc_l) hipblasLtMatrixLayoutDestroy(bc_l);
+    }
+    if (fa.ok) {
+        size_t need = 0;
+        const float one = 1.0f;
+        hipblasLtMatmulAlgo_t algo = fa.algo;
+        if (hipblaslt_ext::matmulIsAlgoSupported(st.handle, p.op, &one, p.a, p.b, &beta, p.c, p.c, algo, need) ==
+                HIPBLAS_STATUS_SUCCESS && need <= st.workspace_bytes) {
+            p.algo = algo;
+            p.ok = true;
+        }
+    }
+    if (!p.ok)
+        std::fprintf(stderr, "prefill gemm: no FP8 hipBLASLt solution for t %d n %d k %d (the FP16 path takes it)\n", t, n, k);
+    return p;
+}
+}  // namespace
+#endif
 
 Gemm::~Gemm() {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    delete static_cast<Fp8Cache*>(fp8_cache_);
+    if (fp8_w_) cudaFree(fp8_w_);
+    if (fp8_vec_) cudaFree(fp8_vec_);
+    if (fp8_amax_) cudaFree(fp8_amax_);
+#endif
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
     if (mmq_buf_) cudaFree(mmq_buf_);
@@ -987,22 +1161,24 @@ __global__ void f16_to_bf16_kernel(const __half* __restrict__ in, uint16_t* __re
     if (i < n) out[i] = (uint16_t) (__float_as_uint(__half2float(in[i])) >> 16);   // exact: the value was a BF16
 }
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-                float beta, int64_t ldx, bool x_f16) {
+                float beta, int64_t ldx, bool x_f16, float scale) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    // scale is the GEMM's alpha; the WMMA and FP16-image paths do not take one (they are skipped when scaled)
+    const bool scaled = scale != 1.0f;
     if (ldx <= K) ldx = 0;
 #ifdef STRATA_USE_HIP
     // #313 (opt-in STRATA_WMMA_GEMM=1; STRATA_WMMA_BF16=0 excludes bf16): RDNA3 / RDNA3.5 WMMA dense GEMM, before
     // hipBLASLt; it returns false for shapes it does not take (and off gfx11) and this falls through
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
     static const bool bf16_on = [] { const char* v = std::getenv("STRATA_WMMA_BF16"); return !v || (v[0] != 0 && v[0] != '0'); }();
-    if (wmma_on && bf16_on && ldx == 0 && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
+    if (!scaled && wmma_on && bf16_on && ldx == 0 && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_bf16(X, W, Y, T, N, K, ldy, beta, stream_)) {
         return;
     }
 #endif
 #if defined(__HIPCC__)
-    if (f16_io_) {   // X is the FP16 image (set_act_f16); W goes through the dequantization scratch as FP16
+    if (f16_io_ && !scaled) {   // X is the FP16 image (set_act_f16); W goes through the dequantization scratch as FP16
         // the only accumulating BF16 product is the BF16X2 low part, which bf16x2_mode() turns off with this path
         if (beta != 0.0f) { std::fprintf(stderr, "prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path\n"); std::exit(1); }
         const int64_t rows = std::min<int64_t>(N, scratch_elems_ / K);
@@ -1015,10 +1191,10 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
-    const float alpha = 1.0f;
+    const float alpha = scale;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
-                      beta, stream_, ldx)) {
+                      beta, stream_, ldx, scale)) {
         STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt bf16");
         return;
     }
@@ -1296,6 +1472,102 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 #endif
 }
 
+// STRATA_PF_FP8=1: the dense product of a native (quantized) weight as FP8 E4M3 on both sides - the weight, dequantized to
+// FP16 as before, scaled per row to E4M3's range; the activations per slice of rows by their largest |x|; hipBLASLt's
+// alpha vector (row scale x activation scale) puts the product back on the FP32 scale it had.  Chunks of at least
+// STRATA_PF_FP8_MIN_T rows (default 1024); the numbers differ from the FP16 path (E4M3 keeps 3 mantissa bits).
+bool Gemm::native_fp8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                      int64_t ldy, float beta) {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FP8"); return v && v[0] == '1'; }();
+    static const int64_t min_t = [] { const char* v = std::getenv("STRATA_PF_FP8_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 1024; }();
+    auto* st = static_cast<HipLtState*>(hipblaslt_state_);
+    if (!on || fp8_failed_ || st == nullptr || T < min_t || N * K > scratch_elems_ || K % 16 != 0 || N > INT_MAX ||
+        K > INT_MAX)
+        return false;
+    if (ldy <= 0) ldy = N;
+    const cudaStream_t s = (cudaStream_t) stream_;
+    if (fp8_w_bytes_ < N * K) {
+        if (fp8_w_) cudaFree(fp8_w_);
+        fp8_w_ = nullptr;
+        fp8_w_bytes_ = 0;
+        if (cudaMalloc((void**) &fp8_w_, (size_t) (N * K)) != cudaSuccess) { (void) cudaGetLastError(); fp8_failed_ = true; return false; }
+        fp8_w_bytes_ = N * K;
+    }
+    if (fp8_vec_rows_ < N) {
+        if (fp8_vec_) cudaFree(fp8_vec_);
+        fp8_vec_ = nullptr;
+        fp8_vec_rows_ = 0;
+        if (cudaMalloc((void**) &fp8_vec_, (size_t) (2 * N) * sizeof(float)) != cudaSuccess) { (void) cudaGetLastError(); fp8_failed_ = true; return false; }
+        fp8_vec_rows_ = N;
+    }
+    if (fp8_amax_ == nullptr && cudaMalloc((void**) &fp8_amax_, 256) != cudaSuccess) { (void) cudaGetLastError(); fp8_failed_ = true; return false; }
+    if (fp8_cache_ == nullptr) {
+        fp8_cache_ = new Fp8Cache();
+        std::fprintf(stderr, "prefill gemm: FP8 dense products on (STRATA_PF_FP8=1, chunks of %lld+ rows)\n", (long long) min_t);
+    }
+    auto& cache = *static_cast<Fp8Cache*>(fp8_cache_);
+    // the activations' slices go through the scratch once the weight has left it: rows of K bytes
+    const int64_t R = std::min<int64_t>(T, (scratch_elems_ * 2) / K);
+    for (int64_t r0 = 0; r0 < T; r0 += R) {   // every slice's shape must have a plan before anything is launched
+        const int64_t rows = std::min(R, T - r0);
+        if (rows > INT_MAX || !fp8_plan(cache, *st, (int) rows, (int) N, (int) K, (int) ldy, beta).ok) return false;
+    }
+    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    float* wscale = fp8_vec_;
+    float* alpha = fp8_vec_ + N;
+    fp8_rows_kernel<<<(unsigned) N, 256, 0, s>>>(scratch_, K, fp8_w_, wscale);
+    uint8_t* x8 = reinterpret_cast<uint8_t*>(scratch_);
+    for (int64_t r0 = 0; r0 < T; r0 += R) {
+        const int64_t rows = std::min(R, T - r0), n = rows * K;
+        const unsigned g = (unsigned) std::min<int64_t>((n + 255) / 256, 4096);
+        cudaMemsetAsync(fp8_amax_, 0, 4, s);
+        fp8_amax_kernel<<<g, 256, 0, s>>>(X + r0 * K, n, fp8_amax_);
+        fp8_act_kernel<<<g, 256, 0, s>>>(X + r0 * K, n, fp8_amax_, x8);
+        fp8_alpha_kernel<<<(unsigned) ((N + 255) / 256), 256, 0, s>>>(wscale, N, fp8_amax_, alpha);
+        const Fp8Plan& p = fp8_plan(cache, *st, (int) rows, (int) N, (int) K, (int) ldy, beta);
+        const hipblasStatus_t rs = hipblasLtMatmul(st->handle, p.op, alpha, fp8_w_, p.a, x8, p.b, &beta, Y + r0 * ldy, p.c,
+                                                   Y + r0 * ldy, p.c, &p.algo, st->workspace, st->workspace_bytes, s);
+        if (rs != HIPBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "prefill gemm: the FP8 product failed (status %d, t %lld n %lld k %lld)\n", (int) rs,
+                         (long long) rows, (long long) N, (long long) K);
+            std::exit(1);   // part of Y may be written: no silent fallback
+        }
+    }
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
+        std::fprintf(stderr, "prefill gemm: native_fp8: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+#else
+    (void) X; (void) ggml_type; (void) W_blocks; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta;
+    return false;
+#endif
+}
+
+bool Gemm::fp8(const uint8_t* X8, const uint8_t* W8, const float* alpha, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    auto* st = static_cast<HipLtState*>(hipblaslt_state_);
+    if (st == nullptr || T <= 0 || K % 16 != 0 || N > INT_MAX || K > INT_MAX || T > INT_MAX) return false;
+    if (ldy <= 0) ldy = N;
+    if (fp8_cache_ == nullptr) fp8_cache_ = new Fp8Cache();
+    auto& cache = *static_cast<Fp8Cache*>(fp8_cache_);
+    const float beta = 0.0f;
+    const Fp8Plan& p = fp8_plan(cache, *st, (int) T, (int) N, (int) K, (int) ldy, beta);
+    if (!p.ok) return false;
+    const hipblasStatus_t rs = hipblasLtMatmul(st->handle, p.op, alpha, W8, p.a, X8, p.b, &beta, Y, p.c, Y, p.c, &p.algo,
+                                               st->workspace, st->workspace_bytes, (cudaStream_t) stream_);
+    if (rs != HIPBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "prefill gemm: fp8: status %d (t %lld n %lld k %lld)\n", (int) rs, (long long) T, (long long) N, (long long) K);
+        std::exit(1);
+    }
+    return true;
+#else
+    (void) X8; (void) W8; (void) alpha; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+    return false;
+#endif
+}
+
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
 #ifdef STRATA_USE_HIP
@@ -1346,6 +1618,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif
+    if ((ldx == 0 || ldx == K) && native_fp8(X, ggml_type, W_blocks, Y, T, N, K, ldy, beta)) return;
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;

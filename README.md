@@ -1,414 +1,283 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="380">
-  </picture>
-</p>
+# strata-nemo: Nemotron 3.5 Bolt, Recursive Flint and Ling-3.0-flash on one Radeon AI PRO R9700
 
-<p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a></p>
+`strata-nemo` adds three programs to a copy of [Strata](https://github.com/Niko1221/Strata) (commit `7695859a`, with
+the R9700 and low-RAM patches from [strata-patches](https://github.com/adiirfan/strata-patches)). Each runs one
+mixture-of-experts model on a 32 GB Radeon AI PRO R9700, and each works behind Strata's server, which offers OpenAI-
+and Anthropic-compatible APIs and a web app. Strata's own README is now [README-STRATA.md](README-STRATA.md).
 
-<h3 align="center">Run a state-of-the-art model on your own gaming PC</h3>
+| Program | Model | Weights | Where they live | Context | Code |
+| --- | --- | --- | --- | ---: | --- |
+| `engine/strata-nemo` | [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB), with the [LiLiCorr drafter](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) | 24 GB | all on the card | 262,144 | `src/nemotron/` |
+| `engine/strata-flint` | [Recursive Flint 40B-A2.5B](https://huggingface.co/RecursiveSI/flint), [Q4_1 GGUF](https://huggingface.co/RecursiveSI/flint-int4-gguf) | 26 GB | all on the card | 262,144 | `src/flint/` |
+| `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + system RAM | 131,072 | `src/ling/` |
 
-<p align="center">Support for NVIDIA, AMD, Intel · Windows, Linux, Mac · free and open source</p>
+Ling is too big for the card. Its attention, shared weights and 23 GB of its experts stay on the card. The processor
+computes the other experts from system RAM, and the card's set changes as the conversation goes on (see
+[Ling-3.0-flash](#ling-30-flash)). Flint also runs this way on smaller cards: on an RTX 3080 (10 GB) with 4 GB of its
+experts on the card.
 
-<p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?include_prereleases&label=release" alt="Latest release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://github.com/Niko1221/Strata/stargazers"><img src="https://img.shields.io/github/stars/Niko1221/Strata?style=flat" alt="GitHub stars"></a>
-</p>
+## Results through the server
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+Strata's own benchmark, `tools/strata_bench.py`, against the server (`python -m serve.server --engine strata --config
+...`). Medians, thinking off. The R9700 at a 230 W power limit. Speeds are in tokens per second.
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a 125-billion-parameter model that
-normally needs a server, on a normal PC. It chats, writes code, reads pictures and works with your apps and coding
-agents. Your chats and files stay on your PC.
+| Test | Nemotron | Flint | Ling | Flint, RTX 3080 |
+| --- | ---: | ---: | ---: | ---: |
+| Chat: writing | 125.5 ¹ | 239.2 | 64.0 ² | 78.1 |
+| Chat: first token | 0.13 s | 0.07 s | 0.91 s | 0.32 s |
+| 4K prompt: reading | 4,890 | 6,610 | 1,055 | 2,185 |
+| 4K prompt: first token | 0.84 s | 0.62 s | 3.90 s | 1.88 s |
+| 16K prompt: reading | 5,203 | 6,313 | 931 | 1,484 |
+| 16K prompt: first token | 3.18 s | 2.61 s | 17.6 s | 11.06 s |
+| 32K prompt: reading | 4,988 | 5,569 | 645 | ³ |
+| 32K prompt: first token | 6.62 s | 5.91 s | 50.9 s | ³ |
+| Agent session (6 turns, 4 tools): prompt reused | 69% | 66% | 69% | 68% |
+| Agent session: first token per turn | 0.65 s | 0.49 s | 5.63 s | 2.21 s |
+| Agent session: writing | 104.6 | 208.2 | 62.2 | 72.1 |
+| Runs per test | 3 | 3 | 2 | 3 |
+| Context the server was started with | 262,144 | 262,144 | 65,536 | 20,480 |
 
-**New here?** Check [what you need](#what-you-need), then [install the app](#option-a-the-strata-app).
+¹ With the drafter. The range is wide (107-223) because it depends on how many of the drafter's guesses the model
+keeps. Flint's writing has the server's guessing on (see [Recursive Flint](#recursive-flint)).
 
-- **Runs on a gaming PC.** 32 GB of RAM and graphics memory together is enough to start.
-- **Works with your tools.** It speaks the OpenAI and Anthropic APIs, so Claude Code, Codex CLI, OpenCode and other agents connect to it.
-- **Reads pictures.** They are on by default.
-- **Free.** MIT license, no account, no cloud.
-- **Private.** No telemetry. What Strata downloads, when it uses the internet and how it checks downloads is in [docs/SAFETY.md](docs/SAFETY.md).
+² The range is 44-71. The first chat runs before the card holds the experts chat uses; the later ones are faster.
 
-Version 0.2.3 · engine 0.1.48
+³ Longer than the 20,480-token context the RTX 3080 server was started with.
 
-## What you need
+## Nemotron 3.5 Bolt
 
-**You need at least 32 GB of RAM and graphics memory (VRAM) together.** On a Mac or a Ryzen AI Max, that is the unified
-memory. More memory gives a bigger model or a faster one.
+Tokens per second, one run per row, from the command line.
 
-- A 32 GB PC with a 12-16 GB card runs the Coder.
-- 64 GB of RAM runs every size.
+| Prompt | Reading | Writing | Writing with the drafter | Tokens a round ¹ | Card memory | With the drafter |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1K | 4,323 | 79.9 | 122 | 3.3 | 26.0 GB | 27.6 GB |
+| 4K | 5,753 | 79.3 | 118 | 3.2 | 26.0 GB | 27.7 GB |
+| 16K | 5,433 | 78.3 | 112 | 3.1 | 26.1 GB | 27.8 GB |
+| 32K | 5,097 | 76.9 | 185 | 5.7 | 26.3 GB | 27.9 GB |
+| 64K | 4,555 | 74.1 | 127 | 3.8 | 26.5 GB | 28.2 GB |
+| 128K | 3,730 | 68.8 | 154 | 4.9 | 27.1 GB | 28.7 GB |
+| 256K (261,800 tokens) | 2,746 | 60.7 | 163 | 6.0 | 28.2 GB | 29.8 GB |
 
-| Your computer | Details |
-| --- | --- |
-| **NVIDIA** GeForce RTX 20, 30, 40, 50 series (12 GB or more) | Install the app or the Terminal. |
-| **AMD** Radeon RX 6800 and newer, Radeon AI PRO R9700 (12 GB or more) | [AMD cards](docs/AMD_HIP.md) |
-| **Intel** Arc | [Intel Arc](docs/INTEL_ARC.md), [Intel engine](docs/INTEL.md) |
-| **Apple Silicon Mac** (M1 or newer, macOS 15 or newer) | [Mac](docs/MAC.md) |
-| **AMD Ryzen AI Max (Strix Halo)** and other unified-memory systems | [Strix Halo](docs/STRIX_HALO.md) |
-| Older cards and processors | [Older GPUs](docs/OLDER_GPUS.md), [Older CPUs](docs/INSTALL.md#older-cpus-experimental) |
+¹ Tokens written per round with the drafter: the drafter guesses up to 7 tokens, the model checks them in one step and
+keeps the ones it agrees with, plus one of its own. How many it keeps depends on how predictable the text is, not on
+the prompt's length, so the drafter's speed moves around from row to row.
 
-Also needed:
+- **Card memory** here has the context sized to the prompt (`--max-ctx` = prompt + 344). A full 262,144-token context
+  uses the 256K row's memory whatever the prompt.
+- **Short prompts with the drafter:** 123 tokens/s writing a story, 210 answering a worked-arithmetic question
+  (prompts of 26-33 tokens, 400 tokens written).
+- **Quality:** next-token perplexity 4.5656 on 8K tokens of the model's card and 7.5771 on 8K tokens of Strata's
+  `docs/DETAILS.md`. The model card scores 4.5612 with every product kept in 16-bit, about 0.1% better.
+- **Same answer with or without the drafter:** with the drafter, the arithmetic answer above is word for word the
+  same as plain greedy writing.
+- **Why reading slows down with length:** 80 of the model's 88 layers cost the same for every token. The 8 attention
+  layers compare each new token with every one before it, so at 256K they take about half the reading time.
 
-- about 80 GB of free disk (an SSD makes the first start much faster)
-- Windows 10 / 11, Linux or macOS
-- a current graphics driver
+## Recursive Flint
 
-Two or three cards of the same make can share a model ([multi-GPU](docs/MULTI_GPU.md)). Strata never splits a model across
-NVIDIA and AMD cards. Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+Tokens per second, one run per row, from the command line, with the context sized for 262,144 tokens.
 
-## Install
+| Prompt | Reading | Writing | Reading, 8-bit keys | Writing, 8-bit keys |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K | 4,640 | 219 | 4,562 | 216 |
+| 4K | 6,913 | 213 | 6,750 | 211 |
+| 16K | 6,471 | 190 | 6,278 | 194 |
+| 32K | 5,662 | 168 | 5,454 | 175 |
+| 64K | 4,503 | 138 | 4,290 | 150 |
+| 128K | 3,178 | 104 | 2,969 | 120 |
+| 256K (260,000 tokens) | 2,017 | 70.0 | 1,852 | 85.8 |
 
-Pick one option. They all start the same engine and use the same models.
+- **Card memory at its peak:** 30.1-31.4 GB of the card's 32 GB (31.9 GB usable), or 28.4-29.7 GB with 8-bit keys.
+  Nothing spills into system memory. The program itself holds 1.5 GB of RAM, mostly the 1.2 GB token table, which
+  stays in RAM on purpose.
+- **llama.cpp on the same card** (with Flint support, 16-bit cache): 79 tokens/s writing, reading 5,388 at 4K and
+  4,843 at 16K.
+- **8-bit keys** (`FLINT_K8=1`, off by default) store the long-history layers' keys in 8 bits as well as their
+  values. Writing at long context gets faster and 1.8 GB of card memory is freed, but the accuracy loss doubles (below).
+- **Accuracy,** against Flint computed exactly in 64-bit floats (`tools/flint/ref_all.py`), over 512 positions of
+  real text: KL divergence 0.008 with the default 8-bit values, 0.010 with a 16-bit cache, 0.018 with 8-bit keys too.
+  The engine picks the same top token as the exact model 95.3% of the time (94.3% with 8-bit keys). For scale,
+  rounding the layers' inputs to 8 bits, as llama.cpp does, costs 0.068 on a 300-token text.
+- **Guessing ahead** (on in the server): when the text repeats something earlier in the conversation, the server
+  guesses the next 1-3 tokens and checks them in one step. Copying a function out of a 66,000-token prompt goes from
+  128 to about 190 tokens/s, with the same output as plain greedy writing. On fresh text it guesses only when that
+  pays, so the speed is unchanged. `FLINT_SPEC=0` turns it off.
+- **Why writing slows down with length:** 14 of the model's 49 layers compare each new token with every token before
+  it, and Flint spreads that attention widely, so every word reads the whole stored history: 1.9-2.8 GB at 128K. The
+  engine reads it at about 87% of the card's memory bandwidth.
+- **On an RTX 3080** (`FLINT_PLAN` with 4 GB of experts, a 20,480-token context): the server results above. The
+  processor computes the experts the card does not hold, the same split as Ling's.
 
-### Option A: the Strata app
+## Ling-3.0-flash
 
-The easiest way. The app has the engine inside: install it, pick a model, chat. Download the file for your system and
-graphics card from the [releases page](https://github.com/Niko1221/Strata/releases/latest). Not sure which one? See the
-line under the table.
+Ling-3.0-flash-VL is 124B parameters with 5.5B used per token: 42 layers, 35 of them a linear "delta" attention with a
+running state and 7 of them full attention over a compressed history, and 512 experts a layer, 8 used per token. This
+program reads text only; the picture reader is not wired in.
 
-| System | Your graphics card | File to download |
-| --- | --- | --- |
-| **Windows 10 / 11** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-windows-cuda13.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda13.exe) |
-| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-windows-cuda12.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda12.exe) |
-| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-windows-hip.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip.exe) |
-| | AMD Radeon RX 7000 series or Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-windows-hip-rdna3.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip-rdna3.exe) |
-| **Linux** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-linux-nvidia-cuda13.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda13.AppImage) |
-| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-linux-nvidia-cuda12.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda12.AppImage) |
-| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-linux-amd-rx9070.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx9070.AppImage) |
-| | AMD Radeon RX 7000 series | [`Strata-0.2.3-linux-amd-rx7900.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx7900.AppImage) |
-| | AMD Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-linux-amd-strixhalo.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-strixhalo.AppImage) |
-| **Mac** (Apple Silicon, macOS 15 or newer) | built in | [`Strata-0.2.3-mac.dmg`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-mac.dmg) |
+- **What sits where:** the card holds the attention, the shared expert, the output layer and 23 GB of the routed
+  experts (26.0 GB in all). The rest of the experts stay in the GGUF, read through the file mapping, so it wants
+  about 67 GB of free RAM to keep them out of the disk. Each layer's experts on the card and on the processor run at
+  the same time, and the card adds the processor's share when it is ready.
+- **The card's experts follow the conversation.** Which experts a text uses depends on the kind of text. A set picked
+  from code and documentation covered 87% of what that text used, but only 37% of what everyday chat used; a set
+  picked from half of the chat covered 79% of the other half. So the engine counts each layer's routing as it goes,
+  and an expert used more than the layer's least-used one on the card takes its place: up to 2 after each written
+  token, and up to 64 a layer for each prompt chunk, copied from where the prompt path already put them on the card.
+  Over 24 chat questions, writing went from about 44 to about 70 tokens/s with it. `LING_ADAPT=0` keeps the starting
+  set fixed.
+- **Command line:** about 79 tokens/s writing after a 1,500-token code prompt, read at about 300 tokens/s. Each prompt
+  chunk copies the experts it uses that the card lacks, which costs much the same for a short chunk as a long one, so
+  longer prompts read faster (1,055 tokens/s at 4K through the server).
+- **Accuracy,** against Ling computed exactly in 64-bit floats (`tools/ling/ref_ling.py`, dequantizing the same
+  GGUF): KL divergence about 1e-11 on the writing path and 3e-8 on the prompt path, the same top token at every
+  position. The prompt path's matrix-core products split each input into two 16-bit halves, so they stay this close.
+- **Context:** 131,072 tokens, the model's own limit (its GGUF says so, and it carries no setting for stretching it
+  further). All working memory is set aside at start: at 131,072 tokens 0.75 GB of the card stays free, at 65,536
+  (the benchmark above) 1.8 GB.
+- **Conversation reuse:** the delta layers' running state cannot be rewound to an earlier token, so the engine saves
+  it one token before the end of each prompt (`LING_SNAPS`, 4 kept). A turn that extends the last one goes on from
+  where it stopped; otherwise from the latest saved state inside the shared part.
 
-**If you are unsure:** for NVIDIA, take `cuda13` if your driver is version 580 or newer, otherwise `cuda12`. `cuda12` is
-for older cards and older drivers. The `hip` and `amd` files are for AMD cards. RX 6000 cards have no installer of
-their own: install `hip-rdna3` (Windows) or `amd-rx7900` (Linux), and on a PC with an RX 6000 card it fetches the RX 6000 engine by itself
-(also `strata update`). That engine is built but not yet tested on a real RX 6000 card: see [AMD cards](docs/AMD_HIP.md).
+## How these were measured
+
+- **Programs:** from the command line for the per-model tables; through the server for the shared table.
+- **Prompts:** real text, not repeated: the ONNX Runtime and llama.cpp documentation, joined and cut to each size.
+  Then 256 tokens written greedily, continuing the text.
+- **Card memory:** the card's peak use during the run (GB here as on the card's box: 1,073,741,824 bytes).
+
+**Desktop:**
+- AMD Ryzen 5 7500F (6 cores), 96 GB DDR5-5600.
+- Radeon AI PRO R9700 32 GB at a 230 W power limit (default 300 W).
+- Debian 13, kernel 7.1.8, ROCm 10.2.0a20261009 (AMD TheRock).
+- The RTX 3080 runs in the same desktop, on PCIe 4.0 x8, built with clang 19 and CUDA 12.5.
+
+## Build
+
+Build against AMD TheRock ROCm 10 (`pip install "rocm[libraries,devel,device-gfx1201]"` from
+`https://nightly.repo.amd.com/rocm/whl-next/`; the SDK folder is its `_rocm_sdk_devel`):
+
+```sh
+tools/r9700/build-nemo.sh <ROCm 10 SDK dir>     # writes engine/strata-nemo
+tools/r9700/build-flint.sh <ROCm 10 SDK dir>    # writes engine/strata-flint
+tools/r9700/build-ling.sh <ROCm 10 SDK dir>     # writes engine/strata-ling
+tools/cuda/build-flint.sh                       # Flint for NVIDIA: writes engine/strata-flint-cuda
+```
+
+## Run from the command line
+
+The programs read and write token ids, not text. Turn a prompt into ids with the model's tokenizer (apply the chat
+template yourself for a chat), for example:
+
+```python
+from tokenizers import Tokenizer
+tok = Tokenizer.from_file("<model dir>/tokenizer.json")
+open("prompt_ids.txt", "w").write(",".join(map(str, tok.encode(text, add_special_tokens=False).ids)))
+```
 
 Then:
 
-- **Windows:** run the `.exe`. It installs for your user and needs no administrator rights. If Windows says "Windows
-  protected your PC", choose **More info**, then **Run anyway** (the installer is not code-signed yet).
-- **Linux:** make the file runnable (`chmod +x`) and start it. It needs FUSE 2: `sudo apt install libfuse2` (Ubuntu 22.04)
-  or `libfuse2t64` (Ubuntu 24.04 and newer).
-- **Mac:** open the `.dmg` and drag Strata onto Applications.
+```sh
+# Nemotron: first write the tensor list the model and the drafter each need
+python3 tools/nemotron/manifest.py <model dir>
+python3 tools/nemotron/manifest.py <drafter dir>
+engine/strata-nemo --model <model dir> --ids @prompt_ids.txt --new 256 --max-ctx 262144
+engine/strata-nemo --model <model dir> --ids @prompt_ids.txt --new 256 --max-ctx 262144 --mode spec --draft <drafter dir>
+engine/strata-nemo --model <model dir> --ids @text_ids.txt --ppl --max-ctx 9000      # perplexity over a text
 
-On the first screen the app reads your PC and recommends a model that fits. Press install. The model is a big download
-(about 40-70 GB) and continues where it stopped if it is interrupted. Closing the window stops Strata and the engine.
+# Flint
+engine/strata-flint --model flint-int4-q4_1.gguf --ids @prompt_ids.txt --new 256 --max-ctx 262144
 
-### Option B: the Terminal (one line)
+# Ling: LING_PLAN names the experts the card starts with (below)
+LING_PLAN=plan-23gb.txt engine/strata-ling --model Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf \
+    --ids @prompt_ids.txt --new 256 --max-ctx 131072
+```
 
-The Terminal is the `strata` command, for scripts, servers and AI agents.
+The written token ids go to standard output, the speeds to standard error. `--ids` also takes the ids inline
+(`--ids 1784,8961,1307`).
 
-Linux and Mac:
+**Expert plans** (Ling, and Flint on a smaller card): run some text with `LING_ROUTE_DUMP=<file>` (Flint:
+`FLINT_ROUTE_DUMP`) to record the routing, then pick the most used experts up to a size:
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh
+python3 tools/flint/make_plan.py plan-23gb.txt routes1.bin routes2.bin --model ling --experts 23GB
 ```
 
-Windows (PowerShell):
+Without a plan, Ling starts with no experts on the card and the processor computes them all.
 
-```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
-```
+## Run through the server
 
-The script checks your PC, downloads the Terminal, verifies its SHA-256 and unpacks it into your home folder. It needs no
-administrator rights. On Windows, open a new terminal window afterwards. Then start Strata:
+Write the model's tokenizer folder, then a config for it:
 
 ```sh
-strata launch
+python3 tools/nemotron/export_tokenizer.py <model dir> <tokenizer dir>                 # Nemotron
+python3 tools/strata_tokenizer.py --gguf flint-int4-q4_1.gguf --out <dir>                # Flint: <dir>/tokenizer
+python3 tools/strata_tokenizer.py --gguf Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf --out <dir>   # Ling
+python -m serve.server --engine strata --config strata-ling.json --port 8080
 ```
-
-It asks one question at a time: model, context, pictures, who may connect. Then it downloads the engine for your graphics
-card (signed, and test-started before use) and the model, and starts serving. For scripts and AI agents, use flags:
-
-```sh
-strata launch --model q2_0 --yes --no-tui
-```
-
-To read the install script before it runs, download it first with `curl -fsSL <address> -o install.sh`, read it, then run
-`sh install.sh`. All screens and flags: [docs/TERMINAL_LAUNCH.md](docs/TERMINAL_LAUNCH.md).
-
-### Option C: let your AI set it up
-
-Paste this into Claude Code, Cursor, Codex, GitHub Copilot or another coding assistant:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
-```
-
-It checks your graphics card, RAM and disk, picks the model that fits, installs and starts it, and tells you how to
-connect your apps. AI tools can also install, start and stop Strata through its [MCP server](docs/MCP_SERVER.md).
-
-Prefer to build it yourself? See [Build from source](#build-from-source).
-
-## Models
-
-The app and `strata launch` recommend a model for your memory. It is one model in several sizes, compressed more or less.
-Smaller sizes are faster. Larger sizes are a bit smarter.
-
-### Low on memory? Try Gyro
-
-[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) (by agentionai) is the smallest way to run this model.
-
-| Size | Memory it needs (RAM + VRAM) | Download | What it is |
-| --- | ---: | ---: | --- |
-| **Gyro-S** | 27.6 GB | 58.5 GB | For PCs that fit nothing else. Quality is lower than IQ2_XS. |
-| **Gyro-M** | 35 GB | 92.0 GB | About IQ3_XXS quality with about 20% less GPU memory. It writes answers 16% (12 GB RTX 3060) to 21% (R9700) slower than Q2_0. |
-
-Gyro runs on NVIDIA and AMD cards (AMD is experimental) on Intel Arc cards on Linux (tested on an Arc A750) and, from 0.2.2, on Apple Silicon Macs (Gyro-S on a 32 GB Mac mini: 9 tok/s, streaming from the SSD; [docs/MAC.md](docs/MAC.md#gyro-s-and-gyro-m-agentionais-trellis-experts)). Details and measurements:
-[docs/GYRO.md](docs/GYRO.md). Start it with `strata launch --model gyro-s`.
-
-### The other sizes
-
-The tiers count your RAM plus your VRAM, less 5 GB that Windows and the system keep for themselves. Every other size stays a choice.
-
-| Your memory (RAM + VRAM) | Take | Notes |
-| --- | --- | --- |
-| **32 GB** | **Gyro-S**, or the **[Coder](docs/MODELS.md#coder)** for code | The Coder needs 32 GB of RAM and keeps half of the experts, so it is weaker outside code |
-| **40 GB** | **[Swift 1.5](docs/MODELS.md#swift-15)** IQ2_XS (39.2 GB), or **Gyro-M** (35 GB) | Swift thinks for a shorter time before it answers. Gyro-M is close to IQ3_XXS in quality, but it writes answers 16-21% slower than Q2_0 |
-| **48 GB** | **IQ3_XXS** (47.0 GB) | Slower, better |
-| **64 GB** | **IQ3_S** (54.8 GB), the original or Swift 1.5 | The slowest, the best: it matches the full model on the published tests |
-| **96 GB or more** | Unsloth's **UD-IQ4_XS** (about 72 GB of RAM) to **Q8_0** (about 136 GB), 4 to 8 bit | Closer to the full model. With less RAM, Strata reads part of them from the SSD, which is much slower |
-
-Less RAM than a row says can still work: Strata switches to its
-[low-RAM mode](docs/MODELS.md#a-big-graphics-card-and-little-ram) by itself. Expect it to be slower, and much slower
-with a small graphics card.
-
-More choices:
-
-- **[Swift 1.5](docs/MODELS.md#swift-15)** is a fine-tune that thinks for a shorter time before it answers, at about the same quality and RAM.
-- **[NVFP4](docs/NVFP4.md)** is NVIDIA's 4-bit version for NVIDIA cards. It needs about 80 GB of RAM to keep every expert in RAM.
-- **[Qwen3.6-35B-A3B](docs/QWEN36.md)** is a smaller, different model that reads pictures and can answer several requests at once.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** is set up by hand.
-
-Every size, download and what fits where: [docs/MODELS.md](docs/MODELS.md).
-
-### DeepSeek V4.1-Flash (in the Terminal, from 0.2.4)
-
-[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) is a different, much bigger model. ISTA-DASLab made the three sets below. Strata runs them on a PC with one 12 GB graphics card and 46 to 64 GB of RAM, and reads the rest from your SSD. It runs on NVIDIA RTX 30 to 50 cards and on the Radeon AI PRO R9700. It uses its own engine package, `strata-dsv41`, which `strata launch` downloads when you pick DeepSeek. The desktop app does not offer it yet.
-
-| Set | Download | Quality against the original model | Writes at |
-| --- | ---: | --- | --- |
-| **IQ1_M** (1.75 bits) | 239 GB | KL 0.217, perplexity 3.80 (+21%); code +8.9%, agent work +10.2%; weaker on plain English prose. ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6). | not measured yet |
-| **IQ2_XXS** (2.00 bits) | 257 GB | KL 0.170, perplexity 3.63 (+15.5%); code +8.6%, agent work +5.3% | 6 to 9 tokens/s on an RTX 3060, about 5 on an RTX 5070 |
-| **IQ2_XS** (2.25 bits) | 274 GB | KL 0.107, perplexity 3.37 (+7.3%); code +3.2%, agent work +2.2% | about 11 tokens/s on one Radeon AI PRO R9700 |
-| **IQ4_NL** (Engram table, not a third model) | 111 GB, already in all three downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD. All three sets use this one file (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`). | n/a |
-
-4x Radeon AI PRO R9700: about 31 tokens/s, 55 to 69 with DSpark.
-
-Start it with `strata launch --model ist-das-2.00bpw` (or `ist-das-1.75bpw`, `ist-das-2.25bpw`). Details, speeds per card and the manual install: [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
-
-## How fast is it?
-
-Based on a 12 GB graphics card (RTX 5070, Ryzen 5 7600, 64 GB RAM). See results from other cards:
-[speed of each model](docs/MODELS.md#how-fast-is-each-size), [community results](docs/COMMUNITY_BENCHMARKS.md).
-
-| Model | Answers appear at | Reads your prompt at |
-| --- | --- | --- |
-| **Q2_0** | `████████████` 94 tokens/s | `████████████` 2,650 tokens/s |
-| **IQ2_XS** | `██████████░░` 79 tokens/s | `█████████░░░` 2,090 tokens/s |
-| **IQ3_XXS** | `████████░░░░` 62 tokens/s | `████████░░░░` 1,750 tokens/s |
-| **IQ3_S** | `███████░░░░░` 53 tokens/s | `███████░░░░░` 1,620 tokens/s |
-| **Coder** | `███████░░░░░` 55 tokens/s | `██████████░░` 2,180 tokens/s |
-
-A token is about ¾ of a word, so 60 tokens per second is faster than you can read. "Reads your prompt" is how fast Strata
-takes in a long document, code or chat history.
-
-Measured on a 16 GB AMD card (RX 9070 XT, Ryzen 9 3900X, 47 GB RAM):
-
-| Model | Answers appear at | Reads your prompt at |
-| --- | --- | --- |
-| **Q2_0** | `████████░░░░` 60 tokens/s | `█████░░░░░░░` 1,160 tokens/s |
-| **IQ2_XS** | `███████░░░░░` 52 tokens/s | `█████░░░░░░░` 1,110 tokens/s |
-| **Coder** | `██████░░░░░░` 44 tokens/s | `██████░░░░░░` 1,420 tokens/s |
-
-The bars use one scale for both tables. A card with more VRAM is faster: an RTX 3090 (24 GB) should write about 100-140
-tokens per second. The engine version behind each number is in [DETAILS.md](docs/DETAILS.md#speed-measured).
-
-## Using it
-
-### In the app
-
-The app has a **Chat**, a **Monitor** of the model and your GPU, CPU and RAM, a **Models** page and **Settings**. The chat
-can work in a folder on your PC. In **Manual** mode it asks before it changes a file or runs a command. Type
-`/loop 10m <what to do>` to repeat a message every 10 minutes while the chat is open.
-
-The chat can search the web with DuckDuckGo (or Bing), with no account. You can add a search key under **Settings, Tools**.
-Search is the one feature that sends something off your PC, the search words.
-
-To run two models, turn on **Run multiple models** and give each model its own card of the same make.
-
-<p align="center"><img src="docs/media/app-chat.png" width="900" alt="The Strata app: a chat where the agent built a small voxel pagoda garden, with the page open in the preview on the right"><br>
-<sub>A chat in the Strata app: the agent wrote a small voxel pagoda garden as one HTML file, and the page opens in the preview next to the conversation</sub></p>
-
-### In the Terminal
-
-<p align="center"><img src="docs/media/terminal-monitor.png" width="900" alt="The Strata Terminal monitor overview while the model writes a reply"><br>
-<sub><code>strata monitor</code> while the model writes a reply: speed, GPU, memory and the recent requests</sub></p>
-
-```sh
-strata launch                                  # guided screens: model, context, pictures, access, then serve
-strata launch --model q2_0 --yes --no-tui     # no questions: serve, print the address, return
-strata launch --plan --model q2_0              # show what would happen; nothing changes
-strata launch --status                         # what is being served now
-strata launch --stop                           # stop it
-strata monitor --url http://127.0.0.1:8080     # watch speed, GPU, memory and requests
-strata update --check                          # is there a new engine? (strata update installs it)
-strata doctor                                  # check the installed engine files
-```
-
-`strata --help` lists everything. Starting and serving never download anything. Only the install, `strata launch` (when
-you choose a model) and `strata update` do. To reach Strata from your phone or another PC, use
-`strata launch --access lan`. It makes an API key (recommended; add `--no-api-key` to go without, with a warning). No browser opens unless
-you add `--open`. Guide: [docs/TERMINAL_LAUNCH.md](docs/TERMINAL_LAUNCH.md). Whole client: [docs/TERMINAL.md](docs/TERMINAL.md).
-
-### With AI agents
-
-An agent installs Strata with the one-line command in Option B and runs
-`strata launch --model NAME --yes --no-tui`. The steps, flags and exit codes are in [docs/AI_SETUP.md](docs/AI_SETUP.md),
-and the repository rules are in [AGENTS.md](AGENTS.md).
-
-### Connect your other apps
-
-| App type | Base URL |
-| --- | --- |
-| OpenAI-compatible (most apps and agents) | `http://127.0.0.1:8080/v1` (any API key, any model name) |
-| Anthropic API (Claude Code and others) | `http://127.0.0.1:8080`, without `/v1`. These apps add `/v1/messages` themselves. Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` |
-| OpenAI Responses API (Codex CLI) | `http://127.0.0.1:8080/v1/responses` ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)) |
-
-`strata connect` prints the exact settings for OpenCode, Codex CLI, Claude Code, oh-my-pi, pi, Hermes Agent and OpenClaw.
-`strata connect opencode --write` writes the file after asking and keeps a backup.
-
-### Pictures
-
-Pictures are on by default for models that can read them. Attach or paste a picture in the chat, or send it from your app.
-The picture reader runs on the processor when your graphics card has less than 24 GB (a few seconds per picture, nothing
-taken from the card's memory) and on the graphics card from 24 GB. The rule is the same for NVIDIA and AMD. Turn pictures
-off per model, or choose the reader with `--vision off`, `--vision gpu` or `--vision cpu`.
-
-The numbers behind the rule: on a Radeon AI PRO R9700 the card's reader took 57 ms for a 260-token picture and the
-processor's took 3.1 s. On 16 GB cards (Tesla P100 and RTX A4000, Linux) the card's reader cost 3-5% of text speed,
-because it holds about 1.4 GB that the model would use otherwise. On a Mac the reader runs on the Mac's GPU whatever its memory (0.45 s for a 260-token picture on an M4 with 32 GB, about 1.2 GB of the shared
-memory); the processor reader needs about 50 s per picture there, so it runs only when you ask for it with `--vision cpu`.
-
-### Good to know
-
-- Choose the thinking level (**off, low, medium or high**) in the chat menu or in your app's "reasoning effort". Off is fastest.
-- Strata answers one request at a time by default. For several at once, use `--parallel N` in `strata launch` or
-  `"parallel": 2` in the config ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up messages start in seconds.
-- Where your chats are stored and the whole API: [docs/INSTALL.md](docs/INSTALL.md#where-things-are-stored), [docs/DETAILS.md](docs/DETAILS.md#using-it).
-
-## Build from source
-
-<details>
-<summary>Windows, Linux and Mac from the repository</summary>
-
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it, or `git clone` it.
-**Windows:** double-click `START-HERE.bat`. **Linux:** run `./setup.sh` in the Strata folder.
-
-**Mac (Apple Silicon, macOS 15 or newer):** install Apple's Command Line Tools once with `xcode-select --install`
-(Xcode itself is not needed). Open Terminal in the Strata folder and run `./setup.sh`. It builds the Mac engine on your
-Mac (about 7 minutes), asks the same questions, downloads the model and starts it. Next time, `./setup.sh` starts it
-right away. Which size fits your Mac: [docs/MAC.md](docs/MAC.md).
-
-The installer finds your card and sets up the right engine. It asks which model and size, how much context (how much text
-the model keeps in mind) and whether it should read pictures. Press Enter for the recommended answer. Then it downloads the
-model (about 70 GB) and starts it. If the download stops, run it again and it continues. Your browser opens the Strata
-page at `http://127.0.0.1:8080`.
-
-> While the model starts, your PC can be slow or stop responding for 1-3 minutes (longest the first time). Strata loads
-> 35-55 GB into your RAM and locks part of it for the graphics card. Wait, and don't close the window.
-
-Next time, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close its
-window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker, several cards,
-where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
-
-To measure your PC, run `BENCH.bat` (`./bench.sh`). It takes 5-10 minutes and writes a report you can share
-([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
-
-**Optional: more speed on one card when the whole model fits in RAM.** Two opt-in settings by RubenTorney (#1904, #1905).
-They help when you run one graphics card and your RAM holds every expert, for example Q2_0 or IQ3_XXS on a 64 GB PC. Open
-`strata-<model>.json` in the Strata data folder ([where](docs/INSTALL.md#where-things-are-stored)) and add:
-
-- `"--adapt-async", "1"` to the `"args"` list. The expert cache then updates on a helper thread instead of pausing the
-  answer. Measured on an RTX 5070 (Windows, Q2_0): +4-5% decode, +7-10% on code and long documents. Answers can differ
-  slightly from the default and stay the same from run to run.
-- `"STRATA_PIN_BY_NEED": "1"` in the `"env"` block (Windows). Windows can lock only about half the RAM for the graphics
-  card, and this locks the experts the card needs first. Measured on the RTX 5070: +4.4% prompt reading.
 
 ```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+{
+  "exe": "<repo>/engine/strata-ling",
+  "args": ["--model", "<model dir>/Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf", "--max-context", "131072"],
+  "tokenizer": "<dir>/tokenizer",
+  "model_family": "ling",
+  "model_name": "ling-3.0-flash",
+  "lib_dirs": ["<ROCm 10 SDK dir>/lib", "<ROCm 10 SDK dir>/lib/rocm_sysdeps/lib", "<ROCm 10 SDK dir>/lib/llvm/lib"],
+  "port": 8080,
+  "backend": "hip",
+  "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+  "env": {"LING_PLAN": "<model dir>/plan-23gb.txt"}
+}
 ```
 
-Restart Strata after the change. To undo, remove the two entries.
+What changes for the other two:
 
-</details>
+| Field | Nemotron | Flint |
+| --- | --- | --- |
+| `exe` | `engine/strata-nemo` | `engine/strata-flint` (`strata-flint-cuda` on NVIDIA, with `"backend": "cuda"`) |
+| `args` | `--model <model dir> --draft <drafter dir> --max-context 262144` | `--model <dir>/flint-int4-q4_1.gguf --max-context 262144` |
+| `model_family` | `nemotron` | `flint` |
+| `sampling` | temperature 1.0, top_p 0.95 | temperature 1.0, top_p 0.95, top_k 20 |
+| `env` | | on a smaller card: `FLINT_PLAN` |
 
-## How does it work?
+## How it works
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by sharing the work across your whole PC. Picture a library.
+**Nemotron:**
+- **Everything on the card:** every weight stays in its stored format (NVFP4 state-update projections, IQ2_XXS
+  experts, Q8_0 attention and output layer).
+- **Reading** goes in chunks of 4,096 tokens: the state-update projections and the shared expert as 8-bit (FP8)
+  matrix products, the routed experts unpacked straight into the matrix cores' registers, the state-update scan and
+  the attention on the 16-bit matrix cores.
+- **Writing** replays each step as a recorded graph. One token at a time, the chosen experts are read in one launch
+  and multiplied in FP16 pairs, the router picks them in one launch, and the shared expert runs beside them on a
+  second stream. The drafter's checks group the tokens' picks by expert, so each expert is read once.
+- **The drafter** guesses 7 tokens a round. The engine checks only as many as recent rounds suggest will pay off, so
+  hard text costs fewer wasted checks and easy text still checks all 7.
 
-- The model is a team of 24,576 small specialists ("experts"), like 24,576 reference books. Each word needs only 10 of them.
-- **Your graphics card is the desk.** It is small and fast. The roughly 4,000 books used most often lie open on it.
-- **Your RAM is the shelves in the reading room.** All 24,576 books are there. When a word needs a book that is not on the
-  desk, your processor reads it from the shelf at once, while the card keeps working.
-- **Your SSD is the archive.** It holds a 29 GB lookup table. The model reads a few rows of it per word, so it does not
-  need to sit in RAM.
+**Flint and Ling, with experts in RAM:**
+- **One graph a token.** The card writes a layer's expert input and choices into memory the processor can see and
+  raises a flag. The processor's workers (one pinned to each physical core) compute the experts the card does not
+  hold, and a card kernel waits for their flag and adds the result. No call from the host is needed in the middle, so
+  the whole step stays one recorded graph.
+- **Prompts** copy the experts each chunk uses to the card and run them there as grouped matrix products.
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+**Ling:**
+- **Weights are rearranged at load** into forms the card reads in whole 16- or 32-byte pieces (the 4-bit codes
+  first, then the scales). Writing reads one 32-value block of a row per thread.
+- **Full-attention layers** keep the compressed history (512 + 64 values a token) and read it once for all 32 heads
+  per token.
 
-A small helper also guesses the next few words. The big model checks all of them at once and keeps the right ones. You get
-the same answer, 1.6-1.8x sooner. Long texts are read in big pieces, up to 8,192 tokens at a time, at over 1,000 tokens
-per second.
+**Switches:** most newer paths have an environment variable that turns the older one back on. The commit messages
+name them.
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
+## Limits
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+- The programs take and give token ids. The tokenizer, chat template and API are Strata's Python server (`serve/`).
+- Nemotron's command line writes greedily only.
+- Nemotron and Ling are built and tested for the R9700 (gfx1201) only. Flint also builds for NVIDIA cards and was
+  tested on an RTX 3080.
+- Ling reads text only, up to 131,072 tokens; reading a 32K prompt takes about 50 s.
 
-## Something went wrong?
+## License
 
-- **My PC froze the first time Strata started.** It loads the model into RAM. Wait, and don't close the window. Still
-  frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Start the app or `strata launch` again, or run `START-HERE.bat` (or
-  `./setup.sh`) again. It continues where it stopped.
-- **It is very slow, the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does not have
-  enough free RAM. Close other programs (browsers use a lot), or pick a smaller size such as Q2_0 or IQ2_XS.
-- **It says there is no engine for this PC.** In the app, open **Settings, Engine** and press **Update engine**. In the
-  Terminal, run `strata update`. `strata doctor` shows which engine files are installed.
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
-
-More problems and fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues). In the app, attach the file from **Settings, Engine, Diagnostics, View
-logs, Save logs**. In the Terminal, paste the output of `strata doctor`. From source, attach `strata-<model>.log` from the
-Strata folder. For a security problem, report it privately: [SECURITY.md](SECURITY.md).
-
-## Credits and license
-
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was compressed by
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5), agentionai (Gyro)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few parts and
-every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
-
-## Contributing
-
-Found a bug, or want to send a change or a benchmark? Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It says what to
-include so that others can check your work.
-
-## Support Strata
-
-Strata is free and MIT-licensed. I build it and test it on whatever hardware I can get. If it runs well on your PC, a coffee helps
-me keep testing new cards and fixing what you report. No pressure. Using it and reporting what you find helps just as much.
-
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a>
-
-Interested in sponsoring Strata? Contact me via [GitHub](https://github.com/Niko1221).
+The code is under Strata's MIT license (`LICENSE`). The models are not included; their own licenses apply.

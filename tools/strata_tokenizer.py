@@ -78,15 +78,18 @@ DEEPSEEK3_PATTERNS = (
 )
 
 
-def _sequence_findall(patterns, text: str) -> list[str]:
+def _sequence_findall(patterns, text: str, keep_empty: bool = True) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
-    matches and the unmatched spans between them."""
+    matches and the unmatched spans between them (keep_empty=False: an empty match splits nothing, as Hugging Face's
+    Split pre-tokenizer)."""
     pieces = [text]
     for pat in patterns:
         nxt = []
         for piece in pieces:
             pos = 0
             for m in pat.finditer(piece):
+                if not keep_empty and m.end() == m.start():
+                    continue
                 if m.start() > pos:
                     nxt.append(piece[pos:m.start()])
                 nxt.append(m.group())
@@ -99,7 +102,7 @@ def _sequence_findall(patterns, text: str) -> list[str]:
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None, pattern=None):
         self.tokens = tokens
         self.pre = pre
         self.token_types = token_types
@@ -119,7 +122,17 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        if str(pre).startswith("deepseek"):
+        if pattern:
+            # pattern: the pre-tokenizer's split (another model family's, from its exported tokenizer.json); a list:
+            # Hugging Face's Sequence of Split(Isolated) pre-tokenizers, applied one after another, each to every piece
+            # the previous one left (matched and unmatched spans both kept, empty matches skipped, as HF does)
+            if isinstance(pattern, list):
+                seq = [regex.compile(x) for x in pattern]
+                self._split = lambda text: _sequence_findall(seq, text, keep_empty=False)
+            else:
+                self._re = regex.compile(pattern)
+                self._split = self._re.findall
+        elif str(pre).startswith("deepseek"):
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
         else:

@@ -60,7 +60,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, FlintParser, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -88,6 +88,9 @@ from serve import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+# "model_family": "nemotron" in the config: Nemotron's image markers (one <image> per image from its template, written
+# as <img> + one <image> per image token + </img>, as its processor does), set by main()
+MODEL_FAMILY = "qwen"
 
 
 def popen(what: str, args: list, role: str = "engine", **kw):
@@ -3922,8 +3925,15 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # the end markers this tokenizer has as one token: Nemotron has no <|endoftext|>, and spelled out its '<', '|'
+        # and '>' each ended a reply; its </s> is one (Qwen's is three, and stays out).  (Flint ends a turn with
+        # <|end_of_text|> or by starting the next one: <|user|>, <|observation|>, <|developer|>; Ling with <|role_end|>)
+        self.stop_ids = set()
+        for marker in (IM_END, "<|endoftext|>", "</s>", "<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>",
+                       "<|role_end|>"):
+            ids = tokenizer.encode(marker, parse_special=True)
+            if len(ids) == 1:
+                self.stop_ids.update(ids)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
@@ -4843,8 +4853,10 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            nemotron = MODEL_FAMILY == "nemotron"
+            pad = self.tok.encode("<image>" if nemotron else IMAGE_PAD, parse_special=True)[0]
+            start = self.tok.encode("<img>" if nemotron else VISION_START, parse_special=True)[0]
+            end = self.tok.encode("</img>", parse_special=True)[0] if nemotron else None
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             def fetch(src):
@@ -4871,10 +4883,15 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode("<image>" if nemotron else IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
+                if nemotron and t == pad:                  # (its template writes the image marker on its own)
+                    if k == len(encoded):
+                        raise ValueError("the prompt and its images do not match")
+                    out += [start] + [pad] * encoded[k][1] + [end]
+                    k += 1
+                elif t == pad and j > 0 and ids[j - 1] == start:
                     # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
                     if k == len(encoded):
                         raise ValueError("the prompt and its images do not match")
@@ -5127,8 +5144,9 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                                 declared_only=declared_only)
+        # (Flint and Ling write their calls in their own form: FlintParser turns them into the template form as they stream)
+        parser = (FlintParser if MODEL_FAMILY in ("flint", "ling") else self.parser_cls)(
+            thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery, declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -8323,6 +8341,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
+    global MODEL_FAMILY
+    MODEL_FAMILY = str(cfg.get("model_family") or "qwen")
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
@@ -8336,11 +8356,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tcfg = {}
-        try:                                            # the pack's pre-tokenizer name and special ids (DeepSeek's differ)
-            tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        try:                                            # the pack's pre-tokenizer name and special ids (DeepSeek's differ),
+            tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))   # or another family's split
+        except (OSError, ValueError):                   # pattern (a list: several splits in order; Qwen's is the default)
             pass
-        tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+        tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None,
+                           pattern=tcfg.get("pre_patterns") or tcfg.get("pre_pattern"))
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
