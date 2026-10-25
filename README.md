@@ -21,38 +21,35 @@ weights and about 20 GB of experts, 32 GB of RAM holds more, and the rest is rea
 (see [DeepSeek-V4.1-Flash](#deepseek-v41-flash)).
 Ling is too big for the card. Its attention, shared weights and 23 GB of its experts stay on the card. The processor
 computes the other experts from system RAM, and the card's set changes as the conversation goes on (see
-[Ling-3.0-flash](#ling-30-flash)). Flint also runs this way on smaller cards: on an RTX 3080 (10 GB) with 4 GB of its
-experts on the card.
+[Ling-3.0-flash](#ling-30-flash)). Flint can run the same way on a smaller card (`FLINT_PLAN`).
 
 ## Results through the server
 
 Strata's own benchmark, `tools/strata_bench.py`, against the server (`python -m serve.server --engine strata --config
 ...`). Medians, thinking off. The R9700 at a 230 W power limit. Speeds are in tokens per second.
 
-| Test | DeepSeek | Nemotron | Flint | Ling | Flint, RTX 3080 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Chat: writing | 13.0 ⁴ | 125.5 ¹ | 239.2 | 64.0 ² | 78.1 |
-| Chat: first token | 3.68 s | 0.13 s | 0.07 s | 0.91 s | 0.32 s |
-| 4K prompt: reading | 584 | 4,890 | 6,610 | 1,055 | 2,185 |
-| 4K prompt: first token | 7.08 s | 0.84 s | 0.62 s | 3.90 s | 1.88 s |
-| 16K prompt: reading | 1,240 | 5,203 | 6,313 | 931 | 1,484 |
-| 16K prompt: first token | 13.4 s | 3.18 s | 2.61 s | 17.6 s | 11.06 s |
-| 32K prompt: reading | 1,414 | 4,988 | 5,569 | 645 | ³ |
-| 32K prompt: first token | 23.5 s | 6.62 s | 5.91 s | 50.9 s | ³ |
-| Agent session (6 turns, 4 tools): prompt reused | 69% | 69% | 66% | 69% | 68% |
-| Agent session: first token per turn | 12.5 s | 0.65 s | 0.49 s | 5.63 s | 2.21 s |
-| Agent session: writing | 12.3 | 104.6 | 208.2 | 62.2 | 72.1 |
-| Runs per test | 3 | 3 | 3 | 2 | 3 |
-| Context the server was started with | 262,144 | 262,144 | 262,144 | 65,536 | 20,480 |
+| Test | DeepSeek | Nemotron | Flint | Ling |
+| --- | ---: | ---: | ---: | ---: |
+| Chat: writing | 13.0 ³ | 125.5 ¹ | 239.2 | 64.0 ² |
+| Chat: first token | 3.68 s | 0.13 s | 0.07 s | 0.91 s |
+| 4K prompt: reading | 584 | 4,890 | 6,610 | 1,055 |
+| 4K prompt: first token | 7.08 s | 0.84 s | 0.62 s | 3.90 s |
+| 16K prompt: reading | 1,240 | 5,203 | 6,313 | 931 |
+| 16K prompt: first token | 13.4 s | 3.18 s | 2.61 s | 17.6 s |
+| 32K prompt: reading | 1,414 | 4,988 | 5,569 | 645 |
+| 32K prompt: first token | 23.5 s | 6.62 s | 5.91 s | 50.9 s |
+| Agent session (6 turns, 4 tools): prompt reused | 69% | 69% | 66% | 69% |
+| Agent session: first token per turn | 12.5 s | 0.65 s | 0.49 s | 5.63 s |
+| Agent session: writing | 12.3 | 104.6 | 208.2 | 62.2 |
+| Runs per test | 3 | 3 | 3 | 2 |
+| Context the server was started with | 262,144 | 262,144 | 262,144 | 65,536 |
 
 ¹ With the drafter. The range is wide (107-223) because it depends on how many of the drafter's guesses the model
 keeps. Flint's writing has the server's guessing on (see [Recursive Flint](#recursive-flint)).
 
 ² The range is 44-71. The first chat runs before the card holds the experts chat uses; the later ones are faster.
 
-³ Longer than the 20,480-token context the RTX 3080 server was started with.
-
-⁴ DeepSeek with a 32 GB RAM store and the leave-out setting at 0.20 (below), thinking off. A short chat answer is
+³ DeepSeek with a 32 GB RAM store and the leave-out setting at 0.20 (below), thinking off. A short chat answer is
 mostly the slow first seconds after its prompt; a 400-token story writes at 18.2 tokens/s. With nothing else using
 the machine's RAM, the system keeps much of the model's files cached and these prompt speeds are what the card can
 do; with that RAM in use elsewhere, every prompt reads from the SSD (the command-line table below).
@@ -91,13 +88,14 @@ builds, with a 72 GB RAM store, also found such a code at 512K and at a full 1,0
 
 - **Why longer prompts read faster:** reading goes in chunks of 24,576 tokens, and each chunk streams every expert the
   card does not hold, about 110 GB, from RAM and the SSD. A short prompt pays for one full pass, a long one shares
-  each pass among more tokens. The 8K row varies most between runs (333-588 tokens/s on this card).
+  each pass among more tokens. The 8K row varies most between runs: 333-554 tokens/s over five runs with these settings.
 - **Why writing is SSD-bound:** each word uses about 240 experts. With 32 GB of RAM and nothing left out, about 8
   of them a word are neither on the card nor in RAM and were not guessed early enough; the SSD (a Viper VP4300L, PCIe 4.0) gives
   about 5.4 GB/s for reads of this size, 2 ms an expert, and the next layer cannot start until they are in.
 - **Leaving out cold experts** (`STRATA_DS4_DISK_SKIP_W`, 0.20 here): an expert that is not in VRAM or RAM and whose
   routing weight is under 0.20 is left out of that token rather than read from the SSD, about 7% of the experts.
-  Writing goes from 13.7 to 21.1 tokens/s at 32 GB. Against the full model, the same next token 93.6% of the time
+  Writing goes from about 13 to 18-19 tokens/s at 32 GB (two runs each: 13.0 and 12.8 without it, 19.3 and 18.2
+  with it). Against the full model, the same next token 93.6% of the time
   (KL divergence 0.074); two runs of the full model agree 96.6% of the time (0.081), and a setting of 0.35 drops to
   90.0% (0.22). Unset, nothing is left out.
 - **Pictures** go through Strata's server like the Qwen models'. The vision tower comes from DeepSeek's own checkpoint
@@ -165,8 +163,6 @@ Tokens per second, one run per row, from the command line, with the context size
 - **Why writing slows down with length:** 14 of the model's 49 layers compare each new token with every token before
   it, and Flint spreads that attention widely, so every word reads the whole stored history: 1.9-2.8 GB at 128K. The
   engine reads it at about 87% of the card's memory bandwidth.
-- **On an RTX 3080** (`FLINT_PLAN` with 4 GB of experts, a 20,480-token context): the server results above. The
-  processor computes the experts the card does not hold, the same split as Ling's.
 
 ## Ling-3.0-flash
 
@@ -210,7 +206,6 @@ program reads text only; the picture reader is not wired in.
 - AMD Ryzen 5 7500F (6 cores), 96 GB DDR5-5600, a 2 TB Viper VP4300L SSD (PCIe 4.0).
 - Radeon AI PRO R9700 32 GB at a 230 W power limit (default 300 W).
 - Debian 13, kernel 7.1.8, ROCm 10.2.0a20261009 (AMD TheRock).
-- The RTX 3080 runs in the same desktop, on PCIe 4.0 x8, built with clang 19 and CUDA 12.5.
 
 ## Build
 
@@ -399,8 +394,8 @@ name them.
 - DeepSeek's speed depends on the SSD and on how much RAM the store gets. Writing is about 9-19 tokens/s here, and a
   prompt costs at least one pass over the experts the card does not hold (7 s for a 4K prompt).
 - DeepSeek's leave-out setting trades some accuracy for speed (above); set it to 0 for the full model.
-- DeepSeek, Nemotron and Ling are built and tested for the R9700 (gfx1201) only. Flint also builds for NVIDIA cards and was
-  tested on an RTX 3080.
+- DeepSeek, Nemotron and Ling are built and tested for the R9700 (gfx1201) only. Flint also builds for NVIDIA cards
+  (`tools/cuda/build-flint.sh`).
 - Ling reads text only, up to 131,072 tokens; reading a 32K prompt takes about 50 s.
 
 ## License
