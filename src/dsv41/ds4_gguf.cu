@@ -200,6 +200,30 @@ void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, 
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
     q8_quant_kernel<<<grid, kThreads, 0, s>>>(x, ldx, k, q, d);
 }
+// a GEMV call's inputs rounded at once: task z's rows as q8_quant_kernel's (each launch costs the device a few us; a
+// token's GEMVs were ~700 of them)
+struct Q8Task {
+    const float* x;
+    size_t ldx;
+    int rows, k;
+    int8_t* q;
+    float* d;
+};
+struct Q8Tasks {
+    Q8Task t[x3::kMaxMvJobs];
+};
+__global__ void __launch_bounds__(kThreads) q8_quant_multi_kernel(const __grid_constant__ Q8Tasks T) {
+    const Q8Task& a = T.t[blockIdx.z];
+    const int r = blockIdx.y, b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= a.rows || b * 32 >= a.k) return;
+    const float v = a.x[(size_t) r * a.ldx + (size_t) b * 32 + lane];
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;
+    a.q[(size_t) r * a.k + (size_t) b * 32 + lane] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if (lane == 0) a.d[(size_t) r * (a.k / 32) + b] = sc;
+}
 
 // 8 E2M1 codes (a word of 4 code bytes) -> their values as int8: .x the low nibbles' (values 0..3 of the word's bytes),
 // .y the high nibbles' - llama.cpp's get_int_from_table_16 (MIT), the table kvalues_mxfp4
@@ -1072,6 +1096,25 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
 
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
+    // the jobs' int8 inputs: one launch for all of them, an input two jobs share rounded once (DS4_Q8_BATCH=0: a launch a job)
+    static const bool q8_batch = !(std::getenv("DS4_Q8_BATCH") != nullptr && std::atoi(std::getenv("DS4_Q8_BATCH")) == 0);
+    Q8Tasks QT;
+    int nq = 0, qmax_b = 0, qmax_r = 0;
+    auto quant = [&](const float* x, size_t ldx, int rows, int k, int8_t*& q, float*& d) {
+        if (!q8_batch) {
+            q8_quant(x, ldx, rows, k, q, d, s);
+            return;
+        }
+        for (int j = 0; j < nq; ++j)
+            if (QT.t[j].x == x && QT.t[j].ldx == ldx && QT.t[j].rows == rows && QT.t[j].k == k) {
+                q = QT.t[j].q;
+                d = QT.t[j].d;
+                return;
+            }
+        QT.t[nq++] = {x, ldx, rows, k, q, d};
+        qmax_b = std::max(qmax_b, (k / 32 + kWarps - 1) / kWarps);
+        qmax_r = std::max(qmax_r, rows);
+    };
     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
     bool vec[3] = {true, true, true};
@@ -1089,7 +1132,9 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            int8_t* xq = sc->mq + at;
+            float* xd = sc->md + at / 32;
+            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, xq, xd);
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
@@ -1097,8 +1142,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             b.k = m.k;
             b.n = m.n;
             b.ncol = q.ncol;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
+            b.xq = xq;
+            b.xd = xd;
             b.y = q.y;
             b.ycs = q.y_cs;
             b.bias = q.bias;
@@ -1136,14 +1181,18 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            int8_t* xq = sc->mq + at;
+            float* xd = sc->md + at / 32;
+            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, xq, xd);
+            b.xq = xq;
+            b.xd = xd;
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
+    if (nq > 0)
+        q8_quant_multi_kernel<<<dim3((unsigned) qmax_b, (unsigned) qmax_r, (unsigned) nq), kThreads, 0, s>>>(QT);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");
