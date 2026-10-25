@@ -60,6 +60,11 @@ class Template(unittest.TestCase):
         self.assertIn("Reasoning Effort: Low", out)
         self.assertTrue(out.endswith("<think></think>"))
 
+    def test_picture_markers(self):
+        # what Service.prepare looks for in the GLM family: <|image|> right after <|begin_of_image|>
+        msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "what is this?"}]}]
+        self.assertIn("<|begin_of_image|><|image|><|end_of_image|>", self.tpl.render(msgs))
+
     def test_effort_words(self):
         self.assertEqual(frontend.effort_kwargs("high"), {"reasoning_effort": "high"})
         self.assertEqual(frontend.effort_kwargs("none"), {"enable_thinking": False})

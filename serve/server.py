@@ -4859,8 +4859,12 @@ class Service:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             nemotron = MODEL_FAMILY == "nemotron"
-            pad = self.tok.encode("<image>" if nemotron else IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode("<img>" if nemotron else VISION_START, parse_special=True)[0]
+            # GLM-5.3's template writes <|begin_of_image|><|image|><|end_of_image|> for a picture (Qwen's:
+            # <|vision_start|><|image_pad|><|vision_end|>)
+            image_pad, image_start = (("<image>", "<img>") if nemotron else ("<|image|>", "<|begin_of_image|>")
+                                      if self.family == "glm5" else (IMAGE_PAD, VISION_START))
+            pad = self.tok.encode(image_pad, parse_special=True)[0]
+            start = self.tok.encode(image_start, parse_special=True)[0]
             end = self.tok.encode("</img>", parse_special=True)[0] if nemotron else None
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
@@ -4888,7 +4892,7 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode("<image>" if nemotron else IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(image_pad, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if nemotron and t == pad:                  # (its template writes the image marker on its own)
