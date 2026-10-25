@@ -8066,6 +8066,10 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
+        // the RAM store's background refill (cache_settle's) ends before the run: the flow copies a store blob it found
+        // some time after it looked the expert up, unpinned, and the refill's reads reuse the store's coldest slots - one
+        // taken meanwhile handed the run another expert's bytes (garbage rows, then an illegal access in moe_sort)
+        if (store) store->warm_stop();
         // a long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
         // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
         // layer before - so they need their own work only on the last keep = (nl - yoco) (win - 1) + win rows for the
