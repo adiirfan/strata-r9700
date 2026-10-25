@@ -111,6 +111,9 @@ void group(const int32_t*, int64_t, int, int, void*, int32_t*, int32_t*, void*) 
 void experts(const Batch&, int, int64_t, const void*, const void*, const int32_t*, void*, float*, void*) {}
 bool native_supported(int, int) { return false; }
 void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
+bool native_f8_gu(int) { return false; }
+bool dm16_on() { return false; }
+void quantize_act_f8(const float*, int64_t, int64_t, void*, void*) {}
 void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
 }  // namespace strata::prefill::fused
@@ -315,7 +318,13 @@ inline int ring_slots(size_t T) {
     // S6: with the matrix-core attention (the gfx12 default since 148-amd; STRATA_HIP_WMMA=1 or auto elsewhere / forced, on a card that
     // has it) a 96-slot ring: measured with it, 9070 XT 4K prompts 718 -> 1,211 tok/s (16K 1,949 -> 2,032), R9700 4K 2,426 -> 2,483 (16K the same)
     static const bool wmma = strata::kernels::qsa_prompt_attn_matrix_cores_requested();
-    if (!v && g_ring_override <= 0 && wmma) return (int64_t) T >= stream_all_min() ? 96 : STAGE;
+    // R9700, all experts in RAM, fused experts: a 384-slot ring reads 4K prompts 2,350 -> 2,650 tok/s (more blobs in flight
+    // for a chunk whose experts get ~80 rows each) and 16K 1% slower, so chunks up to STRATA_PREFILL_RING_SMALL_MAX tokens
+    // (default 8192) take STRATA_PREFILL_RING_SMALL slots (default 384; 96 = as before), longer ones 96
+    static const int small_ring = [] { const char* e = std::getenv("STRATA_PREFILL_RING_SMALL"); return e ? std::atoi(e) : 384; }();
+    static const int64_t small_max = [] { const char* e = std::getenv("STRATA_PREFILL_RING_SMALL_MAX"); return e ? (int64_t) std::atoll(e) : (int64_t) 8192; }();
+    if (!v && g_ring_override <= 0 && wmma)
+        return (int64_t) T >= stream_all_min() ? ((int64_t) T <= small_max ? std::max(16, std::min(small_ring, ring_cap())) : 96) : STAGE;
 #endif
     // the byte budget as this pack's slots: 1024 fused / 384 not on Q2_0, fewer on a pack with bigger blobs.  The
     // unpinned arm stays a slot count (96): it was measured where the host copies are the limit, and there the ring
@@ -871,6 +880,7 @@ struct PinnedUpload {
 };
 
 struct Prefill::Impl {
+    bool dm16 = false;   // STRATA_PF_DM16: this layer's down rows were stored as BF16 (set per layer, cleared after its combine)
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -3630,6 +3640,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    m.dm16 = fused_nat && fused::dm16_on();   // the down rows of this layer in BF16 (combine reads them so)
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3663,7 +3674,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         pt.mark(kPfGather, cs);
                         // the layer's input to int8 once per token; the rows of each expert from the router's ids
-                        if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                        if (fused_nat && fused::native_f8_gu(mmq_gt)) fused::quantize_act_f8(m.mixed, T, N, m.Xq, m.cs);
+                        else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         else fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // launches over the experts in id order, each at most kMaxBatch experts of which at most a
@@ -4780,9 +4792,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_now && m.pp->sums)
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
+                    else if (m.dm16)
+                        moe_combine_bf16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
                                     use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
+                    m.dm16 = false;
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);

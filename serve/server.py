@@ -8151,6 +8151,37 @@ def _component_exe(reference: str, cfg: dict) -> str:
         raise SystemExit(e.exit_code) from None
 
 
+def warmup_prompt(port: int, api_key: str, from_config: str = "") -> None:
+    """STRATA_WARMUP_TOKENS=N: one throwaway prompt of about N tokens (one token answered) before the server says it is
+    ready.  R9700, all experts in RAM: the first long prompt after a start sometimes read at 550-1,750 tok/s (the GPU
+    waiting up to 20 s for its first expert copies) where the next ones read at 3,300; after a 4K first prompt, they did
+    not.  0 or unset: nothing.  The environment wins over the config's "env"."""
+    try:
+        n = int(os.environ.get("STRATA_WARMUP_TOKENS", "") or from_config or 0)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        return
+    import random
+    import urllib.request
+    filler = ("The lighthouse keeper wrote down the weather, the ships that passed and the state of the lamp every "
+              "evening, and on the last page of each month he added up the hours the light had burned. ")
+    text = "Warm-up %d.\n\n" % random.randint(0, 10 ** 9) + filler * max(1, n // 40) + "\nSay OK."
+    body = {"model": "x", "messages": [{"role": "user", "content": text}], "max_tokens": 1, "temperature": 0}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    t0 = time.monotonic()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), headers)
+        with urllib.request.urlopen(req, timeout=600) as r:
+            done = json.load(r).get("timings", {})
+        print(f"[strata] warm-up prompt: {done.get('prompt_n', '?')} tokens in {time.monotonic() - t0:.1f} s "
+              f"(STRATA_WARMUP_TOKENS={n})", flush=True)
+    except Exception as e:   # a failed warm-up costs nothing but the warm-up
+        print(f"[strata] warm-up prompt failed: {e}", flush=True)
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
@@ -8655,6 +8686,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
+    warmup_prompt(bound_port, svc.api_key, str(((cfg or {}).get("env") or {}).get("STRATA_WARMUP_TOKENS", "")))
     svc.start_idle_unload()
     svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
