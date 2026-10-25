@@ -2799,9 +2799,40 @@ struct Model::Impl {
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
+        warm_libs();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         return true;
+    }
+    // the prompt path's BLAS problems run once at load (DS4_WARM_LIBS=0: not): their first call in a process loads the
+    // library's kernels - seconds for the mixes' F32 GEMM on gfx12, paid by the first prompt's first layer otherwise.  Their outputs are scratch the prompt writes again; the F16 images made on the way stay valid
+    void warm_libs() {
+        if (std::getenv("DS4_WARM_LIBS") != nullptr && std::atoi(std::getenv("DS4_WARM_LIBS")) == 0) return;
+        const double t0 = now_ms();
+        for (size_t di = 0; di < chunks.size() && di < devs.size(); ++di) {
+            if (!chunks[di] || chunks[di]->blas == nullptr || chunks[di]->C <= 0) continue;
+            Chunk& c = *chunks[di];
+            Dev& d = devs[di];
+            cudaSetDevice(d.id);
+            for (Layer& L0 : L) {
+                if (L0.mtp) continue;
+                int mi = -1;
+                for (int m = 0; m < L0.nm; ++m)
+                    if (member(L0, m).dev == (int) di) mi = m;
+                if (mi < 0) continue;
+                Layer& l = member(L0, mi);
+                std::string err;
+                const int T = c.C;
+                bool ok = hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err) &&
+                          gemm(d, c, l.wq_a, c.x16, g.dim, T, c.qr, g.q_lora, 0.0f, err) &&
+                          gemm(d, c, l.wkv, c.x16, g.dim, T, c.kvr, g.hd, 0.0f, err);
+                cudaStreamSynchronize(d.st);
+                (void) cudaGetLastError();
+                if (!ok && o.verbose) std::fprintf(stderr, "ds4: warming the BLAS kernels: %s\n", err.c_str());
+                break;
+            }
+        }
+        if (o.verbose) std::fprintf(stderr, "ds4: the prompt path's BLAS kernels loaded in %.1f s\n", (now_ms() - t0) / 1000.0);
     }
 
 
@@ -7500,24 +7531,34 @@ struct Model::Impl {
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back(l0.eg);
         const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
-        auto read_eg = [this, &c, &run, &egs, eg_per](int k) {
-            if (k >= 2) cudaEventSynchronize(c.eg_ev[k % 2]);
-            for (int li : egs)
-                engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[k % 2] + (size_t) li * c.C * eg_per);
+        // each Engram layer's rows ready on their own (a promise each, read in layer order): a layer waits only for its
+        // own, so the chunk starts at once and a later Engram layer's rows come in while the layers before it run - the
+        // chunk had waited for every Engram layer's rows before its first layer.  Chunk k + 1's are read once chunk k's last Engram layer has its rows.
+        const size_t ne = egs.size();
+        std::vector<std::vector<std::promise<void>>> eg_p((size_t) nk);
+        std::vector<std::vector<std::shared_future<void>>> eg_f((size_t) nk);
+        std::vector<char> eg_go((size_t) nk, 0);
+        std::vector<std::future<void>> eg_task((size_t) nk);   // (last: its tasks end before the promises they keep go)
+        auto launch_eg = [this, &c, &run, &egs, eg_per, &eg_p, &eg_f, &eg_go, &eg_task, nk, ne](int k) {
+            if (ne == 0 || k >= nk || eg_go[(size_t) k]) return;
+            eg_go[(size_t) k] = 1;
+            eg_p[(size_t) k] = std::vector<std::promise<void>>(ne);
+            for (auto& pr : eg_p[(size_t) k]) eg_f[(size_t) k].push_back(pr.get_future().share());
+            eg_task[(size_t) k] = std::async(std::launch::async, [this, &c, &run, &egs, eg_per, &eg_p, k] {
+                if (k >= 2) cudaEventSynchronize(c.eg_ev[k % 2]);
+                for (size_t j = 0; j < egs.size(); ++j) {
+                    engram_rows(run.p0[(size_t) k], run.T[(size_t) k], egs[j], c.eg_host[k % 2] + (size_t) egs[j] * c.C * eg_per);
+                    eg_p[(size_t) k][j].set_value();
+                }
+            });
         };
-        std::future<void> eg_next;
-        if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
+        launch_eg(0);
         for (int k = 0; k < nk; ++k) {
             if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done)
             const int64_t p0 = run.p0[(size_t) k];
             const int T = run.T[(size_t) k], slot = k % 2;
             const bool last_k = k + 1 == nk;
-            if (!egs.empty()) {   // chunk k's rows ready, chunk k + 1's on their way
-                const double te = now_ms();
-                eg_next.get();
-                if (d.mi == 0) st.engram_ms += now_ms() - te;
-                if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
-            }
+            launch_eg(k);   // (already on its way but for a chunk the one before never reached its Engram layers in)
             WinPlan wp;
             wp.par = true;
             wp.async = true;
@@ -7582,6 +7623,16 @@ struct Model::Impl {
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
+                if (L0.eg >= 0 && ne > 0) {   // this Engram layer's rows ready (the chunk's later ones still coming in)
+                    const auto at = std::find(egs.begin(), egs.end(), L0.eg);
+                    if (at != egs.end()) {
+                        const size_t j = (size_t) (at - egs.begin());
+                        const double te = now_ms();
+                        eg_f[(size_t) k][j].wait();
+                        if (d.mi == 0) st.engram_ms += now_ms() - te;
+                        if (j + 1 == ne) launch_eg(k + 1);
+                    }
+                }
                 if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
@@ -7591,6 +7642,7 @@ struct Model::Impl {
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
             }
+            launch_eg(k + 1);   // (a chunk that stopped before its last Engram layer: the next one's rows still read)
             if (di == head_dev && (size_t) k < chunk_done.size()) {
                 CK(cudaEventRecord(chunk_done[(size_t) k], s));
                 chunk_rec[(size_t) k].store(1, std::memory_order_release);
