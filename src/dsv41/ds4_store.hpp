@@ -463,6 +463,13 @@ public:
         const int s = where_[(size_t) layer][(size_t) e];
         if (s >= 0) slots_[(size_t) s].visible = false;
     }
+    /// ready slots whose (layer, expert) f says yes to
+    size_t count_ready(const std::function<bool(int, int)>& f) const {
+        size_t n = 0;
+        for (size_t i = 0; i < nalloc_; ++i)
+            if (slots_[i].state.load(std::memory_order_acquire) == kReady && f(slots_[i].layer, slots_[i].expert)) ++n;
+        return n;
+    }
     size_t visible_count() const {
         size_t n = 0;
         for (size_t i = 0; i < nalloc_; ++i) n += slots_[i].visible ? 1 : 0;

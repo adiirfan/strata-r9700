@@ -87,7 +87,7 @@ struct Stats {
     int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
     // the RAM store (--ssd-cache), totals since the load: reads asked for and found there (hits), missed (misses), started ahead
     // of use (prefetched) of which used / given up unused, slots given up, bytes read, ms the CPU lane waited for the reads
-    int64_t store_hits = 0, store_misses = 0, store_prefetched = 0, store_pf_used = 0, store_pf_wasted = 0, store_evictions = 0;
+    int64_t store_hits = 0, store_misses = 0, store_prefetched = 0, store_pf_used = 0, store_pf_wasted = 0, store_evictions = 0, store_dup = 0;
     int64_t store_bytes = 0, store_fails = 0;
     int64_t store_zc = 0, store_zc_visible = 0;   // experts the GPU computed from the store (zero-copy over PCIe); slots it may read
     double store_wait_ms = 0.0, store_busy_ms = 0.0;

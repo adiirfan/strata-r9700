@@ -9314,6 +9314,10 @@ const Stats& Model::stats() const {
         st.store_zc_visible = (int64_t) x.visible_count();
         st.store_slots = (int64_t) x.slots_allocated();
         st.store_slots_max = (int64_t) x.slots_max();
+        const auto& L = p_->L;   // (slots whose expert VRAM holds as well)
+        st.store_dup = (int64_t) x.count_ready([&](int l, int e) {
+            return l >= 0 && l < (int) L.size() && e >= 0 && e < (int) L[(size_t) l].slot.size() && L[(size_t) l].slot[(size_t) e] >= 0;
+        });
     }
     return st;
 }

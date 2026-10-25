@@ -1471,6 +1471,7 @@ int main(int argc, char** argv) {
                      (long long) s.store_slots, (long long) s.store_slots_max, (long long) (s.store_evictions - s0.store_evictions),
                      (long long) (s.store_fails - s0.store_fails), (double) (s.store_zc - s0.store_zc) / nt,
                      (long long) s.store_zc_visible);
+        std::fprintf(stderr, "store: %lld of its slots hold an expert VRAM holds too\n", (long long) s.store_dup);
     }
     if (s.ahead_picks > s0.ahead_picks) {   // lookahead
         const double p = (double) (s.ahead_picks - s0.ahead_picks), c = (double) (s.ahead_cold - s0.ahead_cold);
