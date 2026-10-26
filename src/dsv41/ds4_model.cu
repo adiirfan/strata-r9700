@@ -506,6 +506,23 @@ struct Dev {
 // the chunked prompt path's buffers on a device: a chunk of C tokens through a layer at once (the attention in slabs of
 // A queries, the indexer in slabs of AI), its GEMMs through FP16 reconstructions of the weights and cuBLAS
 // DS4_PRED_DUMP: a fixed +-1 random projection of the router input (D -> 256), one block a token
+// hc_mix_chunk on HIP: FP32 rows (n rows of K, stride ld) as two BF16 parts, x ~= hi + lo (each rounded to nearest even)
+__device__ __forceinline__ uint16_t f32_bf16_rne(float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+__global__ void split_bf16_k(const float* __restrict__ x, int64_t ld, int K, int n, uint16_t* __restrict__ hi,
+                             uint16_t* __restrict__ lo) {
+    const int64_t m = (int64_t) n * K;
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < m; i += (int64_t) gridDim.x * blockDim.x) {
+        const float f = x[(i / K) * ld + i % K];
+        const uint16_t h = f32_bf16_rne(f);
+        hi[i] = h;
+        lo[i] = f32_bf16_rne(f - __uint_as_float((uint32_t) h << 16));
+    }
+}
+
 __global__ void pred_proj_k(const float* x, int D, float* out) {
     const int t = blockIdx.x, j = threadIdx.x;   // 256 threads
     const float* xr = x + (size_t) t * D;
@@ -3023,6 +3040,39 @@ struct Model::Impl {
     bool hc_mix_chunk(Dev& d, Chunk& c, const float* h, const float* fn, int T, float* mixes, std::string& err) {
         const int hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
         const float one = 1.0f, zero = 0.0f;
+#if defined(STRATA_USE_HIP)
+        // ROCm 10's FP32 GEMM has a large fixed cost a call on gfx1201: the weights and the rows each split into two
+        // BF16 parts in the chunk's F16 scratch (c.w16, free between the dense products on this stream), and
+        // fn.h = fn_hi.h_hi + fn_hi.h_lo + fn_lo.h_hi with an FP32 accumulator, in blocks of the rows the rest of
+        // the scratch holds.  DS4_HC_MIX_F32=1: the FP32 product.
+        static const bool f32 = getenv("DS4_HC_MIX_F32") != nullptr && std::atoi(getenv("DS4_HC_MIX_F32")) != 0;
+        const size_t wn = (size_t) n_mix * hcd;
+        const int rows_t = (int) std::min<size_t>((size_t) T, c.w16_elems > 2 * wn ? (c.w16_elems - 2 * wn) / (2 * (size_t) hcd) : 0);
+        if (!f32 && rows_t > 0) {
+            uint16_t* const fh = c.w16;
+            uint16_t* const fl = fh + wn;
+            uint16_t* const xh = fl + wn;
+            uint16_t* const xl = xh + (size_t) rows_t * hcd;
+            split_bf16_k<<<(unsigned) std::min<size_t>((wn + 255) / 256, 4096), 256, 0, d.st>>>(fn, hcd, hcd, n_mix, fh, fl);
+            for (int t0 = 0; t0 < T; t0 += rows_t) {
+                const int tn = std::min(rows_t, T - t0);
+                const size_t m = (size_t) tn * hcd;
+                split_bf16_k<<<(unsigned) std::min<size_t>((m + 255) / 256, 4096), 256, 0, d.st>>>(
+                    h + (size_t) t0 * hcd, hcd, hcd, tn, xh, xl);
+                const uint16_t* wa[3] = {fh, fh, fl};
+                const uint16_t* xb[3] = {xh, xl, xh};
+                for (int p = 0; p < 3; ++p) {
+                    const float b = p == 0 ? 0.0f : 1.0f;
+                    if (cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n_mix, tn, hcd, &one, wa[p], CUDA_R_16BF, hcd,
+                                     xb[p], CUDA_R_16BF, hcd, &b, mixes + (size_t) t0 * 32, CUDA_R_32F, 32,
+                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+                        err = "cublasGemmEx (mHC mixes, BF16 parts)";
+                        return false;
+                    }
+                }
+            }
+        } else
+#endif
         if (cublasSgemm(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n_mix, T, hcd, &one, fn, hcd, h, hcd, &zero, mixes, 32) !=
             CUBLAS_STATUS_SUCCESS) {
             err = "cublasSgemm (mHC mixes)";
