@@ -220,6 +220,30 @@ model's own tokenizer made of it.
 - **With less RAM,** Qwen's short prompts slow down most (the experts they need come from the SSD); long prompts share
   each pass over the experts among more tokens and lose less.
 
+### Pagoda test
+
+One creative coding prompt to each model, at its all-in-RAM setting:
+
+> Design and create a very creative, elaborate, and detailed voxel art scene of a pagoda in a beautiful garden with
+> trees, including some cherry blossoms. Make the scene impressive and varied and use colorful voxels. Use whatever
+> libraries to get this done but make sure I can paste it all into a single HTML file and open it in Chrome.
+
+![The five pages side by side](examples/pagoda/compare.gif)
+
+| Model | Time | Tokens written | Opens as written? | After small fixes |
+| --- | ---: | ---: | --- | --- |
+| DeepSeek-V4.1-Flash | 940 s | 21,164 | Yes | not needed |
+| GLM-5.3-Flash | 703 s | 19,516 | No: a colour name and a helper it never defined | works after 2 one-line fixes |
+| Qwen3.8-Flash-Next | 492 s | 39,916 | No: a stray `±` sign in the code | runs after 6 fixes; its own fog hides most of the scene from its own camera |
+| Recursive Flint | 66 s | 12,377 | No: a sky object the library does not have | runs after 1 fix; its fog ends before the scene does |
+| Nemotron 3.5 Bolt | 109 s | 14,508 | No: a library address that does not exist, an undefined variable | still blank after 6 fixes |
+
+- Thinking was capped at 8,192 tokens and the answer at 32,768. Qwen's first try used the whole answer and stopped
+  in the middle of its code (410 s); the table shows its second try, with 65,536.
+- The pages as the models wrote them are in [examples/pagoda/as-written](examples/pagoda/as-written), the fixed ones
+  in [examples/pagoda/fixed](examples/pagoda/fixed). The pictures come from Chrome without a graphics card, with the
+  same random seed for every page.
+
 ## DeepSeek-V4.1-Flash
 
 DeepSeek-V4.1-Flash-1017 has 40 layers with 384 experts each, 6 used per token, plus two Engram layers (a lookup
