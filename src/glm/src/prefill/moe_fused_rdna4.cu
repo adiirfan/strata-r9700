@@ -648,8 +648,13 @@ DeviceInfo device_info() {
     d.ready = true;
     cudaDeviceProp prop{};
     ck(cudaGetDeviceProperties(&prop, dev), "properties");
-    // Measured on gfx1151 and gfx1100; other compiled architectures retain MMQ until validated separately.
-    if (std::strncmp(prop.gcnArchName, "gfx1151", 7) && std::strncmp(prop.gcnArchName, "gfx1100", 7)) return d;
+    // Measured on gfx1151 and gfx1100; other compiled architectures retain MMQ until validated separately.  gfx1201
+    // (RDNA4, the R9700: its own WMMA layout above) runs it with STRATA_GLM_PREFILL_FUSED=1: its experts take less
+    // time than MMQ's, but a prompt there waits on the mixer, not on them, so it is not the default yet.
+    const char* want = std::getenv("STRATA_GLM_PREFILL_FUSED");
+    const bool rdna4_on = want != nullptr && want[0] == '1' && !std::strncmp(prop.gcnArchName, "gfx1201", 7);
+    if (std::strncmp(prop.gcnArchName, "gfx1151", 7) && std::strncmp(prop.gcnArchName, "gfx1100", 7) && !rdna4_on)
+        return d;
     hipFuncAttributes fa{};
     if (hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(native_kernel<T_IQ3_XXS, true, true, NW_LB>)) != hipSuccess) {
         (void) cudaGetLastError(); return d;
@@ -666,7 +671,13 @@ bool available() {
         return !(off && off[0] == '0');
     }();
     if (!on) return false;
-    return device_info().ok;
+    const auto d = device_info();
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "glm prefill: the fused native experts (rdna4) %s\n", d.ok ? "are on" : "are off on this GPU (MMQ)");
+    }
+    return d.ok;
 }
 
 bool supported(int gu, int down) {
