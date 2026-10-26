@@ -630,6 +630,232 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
     __builtin_trap();
 #endif
 }
+// STRATA_GLM_PREFILL_F8=1 (gfx12, with STRATA_GLM_PREFILL_FUSED=1): the gate/up product on the FP8 matrix cores,
+// v_wmma_f32_16x16x16_fp8_fp8 - as Strata-r9700's native_w12f8_gu_kernel for Qwen.  A weight is decoded as for
+// native_kernel (int8 code and its scale per 16 / 32 values), then stored as E4M3 at one scale for the whole row (the
+// row's largest block d x f8_bound, / 448); the activations are E4M3 at one scale per token (quant_act_f8_kernel).  The
+// products accumulate in FP32 inside the WMMA - no per-block scaling between them - and the two scales multiply once,
+// before the clamp and the SwiGLU.  H leaves as int8 per 32 values, as native_kernel's (the down product is unchanged).
+// The numbers differ from the int8 path's: E4M3 keeps 3 mantissa bits of each weight and activation.
+#if STRATA_NAT_W12
+typedef float nw_f8v __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ nw_f8v nw_wmma_f8(nw_ab a, nw_ab b, nw_f8v c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
+}
+#endif
+template <int T> __host__ __device__ constexpr float f8_bound() {
+    return (T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S) ? 3.875f * 43.0f : T == T_IQ3_XXS ? 7.75f * 62.0f
+         : T == T_IQ3_S ? 31.0f * 15.0f : 32.0f * 127.0f;   // IQ4_XS: |ls - 32| <= 32, |kvalue| <= 127
+}
+__host__ __device__ constexpr bool f8_gu_type(int t) {
+    return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;
+}
+template <int WT, bool ALIAS = false, int LB = 0>
+__global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
+native_f8gu_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles, const int* bounds,
+                   const Geometry geo, const uint8_t* __restrict__ act, const int32_t* __restrict__ src,
+                   uint8_t* __restrict__ out) {
+#if STRATA_NAT_W12
+    constexpr int NS = GU_ROWS_K / 64;
+    constexpr int NFB = 4096 / NW_ROWS;
+    constexpr int ACT_LD = NS * AB;
+    constexpr int BS = block_bytes(WT);
+    constexpr int NB = GU_ROWS_K / 256;   // the row's 256-value blocks
+    constexpr int GB = grid_bytes(WT) > 0 ? grid_bytes(WT) : 16;
+    __shared__ __align__(16) uint8_t wtbuf[2 * NW_ROWS * WLD];
+    uint8_t(*wt)[NW_ROWS][WLD] = reinterpret_cast<uint8_t(*)[NW_ROWS][WLD]>(wtbuf);
+    __shared__ float rsc[NW_ROWS];
+    __shared__ __align__(16) uint8_t sgrid[GB];
+    constexpr int SGN = (WT == T_IQ2_XXS || WT == T_IQ2_XS || WT == T_IQ2_S || WT == T_IQ3_XXS || WT == T_IQ3_S)
+                            ? sign_entries(WT) : 1;
+    __shared__ __align__(16) uint4 ssign[SGN];
+    __shared__ int srow[kTileRows];
+    __shared__ float hs_sep[ALIAS ? 1 : kTileRows][65];
+    static_assert(!ALIAS || (size_t) kTileRows * 65 * 4 <= (size_t) 2 * NW_ROWS * WLD, "H tile must fit the weight buffers");
+    float(*hs)[65] = ALIAS ? reinterpret_cast<float(*)[65]>(wtbuf) : hs_sep;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
+    (void) lane;
+    if constexpr (grid_bytes(WT) > 0) {
+        const uint32_t* gs = (const uint32_t*) grid_src<WT>();
+        for (int i = tid; i < grid_bytes(WT) / 4; i += NW_THREADS) ((uint32_t*) sgrid)[i] = gs[i];
+    }
+    if constexpr (SGN > 1) {
+        for (int i = tid; i < SGN; i += NW_THREADS) ssign[i] = sign_entry(i, SGN == 128);
+    }
+    uint32_t kv[4] = {0, 0, 0, 0};
+    if constexpr (WT == T_IQ4_XS) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    }
+    const int ur = tid >> 1, uj = tid & 1;
+    const int nwork = ntiles * NFB;
+    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
+        const int2 tile = tiles[w / NFB];
+        const int fb = w % NFB, e = tile.x, row0 = tile.y;
+        const int nrows = min(kTileRows, bounds[e + 1] - bounds[0] - row0);
+        if (nrows <= 0) continue;
+        const uint8_t* blob = wbase + (size_t) e * stride;
+        const uint8_t* wrow = blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row;
+        auto unit = [&](int s) -> const uint8_t* { return wrow + (s >> 2) * BS; };
+        auto sub = [&](int s) { return 2 * (s & 3) + uj; };
+        float dm = 0.0f;
+#pragma unroll
+        for (int k = 0; k < NB; ++k) dm = fmaxf(dm, fabsf(half_at(ld16(wrow + k * BS))));
+        const float rs = dm > 0.0f ? dm * (f8_bound<WT>() / 448.0f) : 1.0f, inv = 1.0f / rs;
+        auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
+            uint32_t q[8];
+            float s0, s1;
+            convert<WT>(raw, sgrid, kv, q, s0, s1, ssign);
+            const float f0 = s0 * inv, f1 = s1 * inv;
+            uint32_t o[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {   // signed byte c: (c + 128) as an unsigned byte, times f, minus 128 f
+                const float f = k < 4 ? f0 : f1, nf = -128.0f * f;
+                const uint32_t u = q[k] ^ 0x80808080u;
+                const float v0 = fmaf((float) (u & 255u), f, nf), v1 = fmaf((float) ((u >> 8) & 255u), f, nf);
+                const float v2 = fmaf((float) ((u >> 16) & 255u), f, nf), v3 = fmaf((float) (u >> 24), f, nf);
+                int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, 0, false);
+                pk = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pk, true);
+                o[k] = (uint32_t) pk;
+            }
+            uint4* d = (uint4*) &wt[buf][ur][32 * uj];
+            d[0] = make_uint4(o[0], o[1], o[2], o[3]);
+            d[1] = make_uint4(o[4], o[5], o[6], o[7]);
+        };
+        __syncthreads();
+        if (tid < kTileRows) srow[tid] = src[row0 + min(tid, nrows - 1)];
+        if (uj == 0) rsc[ur] = rs;
+        uint32_t raw[raw_words(WT)] = {};
+        load_unit<WT>(unit(0), sub(0), raw);
+        put(raw, 0);
+        if (NS > 1) load_unit<WT>(unit(1), sub(1), raw);
+        __syncthreads();
+        const bool on = 32 * wn < nrows;
+        const uint8_t* brow[2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) brow[nt] = act + (size_t) srow[32 * wn + 16 * nt + l16] * ACT_LD;
+        nw_f8v acc[2][2];
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) acc[mt][nt] = nw_f8v{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        nw_frag bq[2][4];
+        auto fetch_b = [&](int s, nw_frag (&q)[2][4]) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const uint2* p = reinterpret_cast<const uint2*>(brow[nt] + s * AB + 8 * hi);
+                q[nt][0] = p[0]; q[nt][1] = p[2]; q[nt][2] = p[4]; q[nt][3] = p[6];
+            }
+        };
+        if (on) fetch_b(0, bq);
+        for (int s = 0; s < NS; ++s) {
+            __syncthreads();
+            nw_frag nbq[2][4];
+            if (on && s + 1 < NS) fetch_b(s + 1, nbq);
+            if (on) {
+                const int bf = s & 1;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int mt = 0; mt < 2; ++mt) {
+                        const int rb = 32 * wm + 16 * mt;
+                        const uint2* ap = reinterpret_cast<const uint2*>(&wt[bf][rb + l16][32 * h + 8 * hi]);
+                        const nw_ab A0 = nw_v(ap[0]), A1 = nw_v(ap[2]);
+#pragma unroll
+                        for (int nt = 0; nt < 2; ++nt)
+                            acc[mt][nt] = nw_wmma_f8(A1, nw_v(bq[nt][2 * h + 1]), nw_wmma_f8(A0, nw_v(bq[nt][2 * h]), acc[mt][nt]));
+                    }
+                }
+            }
+            if (s + 1 < NS) {
+                put(raw, (s + 1) & 1);
+                __syncthreads();
+                if (s + 2 < NS) load_unit<WT>(unit(s + 2), sub(s + 2), raw);
+                if (on) {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) bq[nt][j] = nbq[nt][j];
+                }
+            }
+        }
+        if constexpr (ALIAS) __syncthreads();
+        if (on) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const float ts = *reinterpret_cast<const float*>(brow[nt] + 64);   // the token's activation scale
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    const int rb = 32 * wm + 16 * mt + 8 * hi;
+                    // lane l: local rows rb + i = features 16 wm + 8 mt + 4 hi + j, gate (i = 2j) and up (2j + 1)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float gt = fminf(acc[mt][nt][2 * j] * (rsc[rb + 2 * j] * ts), geo.limit);
+                        const float up = fminf(fmaxf(acc[mt][nt][2 * j + 1] * (rsc[rb + 2 * j + 1] * ts), -geo.limit), geo.limit);
+                        hs[32 * wn + 16 * nt + l16][16 * wm + 8 * mt + 4 * hi + j] = gt / (1.0f + __expf(-gt)) * up;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        // H block fb (64 features) to int8 per 32 (native_kernel's GU epilogue)
+        if (tid < 2 * kTileRows) {
+            const int r = tid >> 1, hh = tid & 1;
+            if (r < nrows) {
+                float am = 0.0f;
+#pragma unroll 8
+                for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
+                const float iv = am > 0.0f ? 127.0f / am : 0.0f;
+                uint8_t* o = out + (size_t) (row0 + r) * (32 * AB) + (size_t) fb * AB;
+                uint32_t wd[8] = {};
+                int csum = 0;
+#pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    const int c = __float2int_rn(hs[r][32 * hh + j] * iv);
+                    csum += c;
+                    wd[j >> 2] |= (uint32_t) (uint8_t) (int8_t) c << (8 * (j & 3));
+                }
+                uint4* o4 = reinterpret_cast<uint4*>(o + 32 * hh);
+                o4[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+                o4[1] = make_uint4(wd[4], wd[5], wd[6], wd[7]);
+                *reinterpret_cast<float*>(o + 64 + 4 * hh) = am / 127.0f;
+                *reinterpret_cast<float*>(o + 72 + 4 * hh) = (float) csum;
+            }
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+// one block per token: its largest |x| -> ts = max / 448, the row in E4M3 at that scale, in the native activation
+// layout (80 bytes per 64 values: 64 codes, then ts in the block's first scale slot)
+__global__ void __launch_bounds__(256) quant_act_f8_kernel(const float* __restrict__ x, int cols, uint8_t* __restrict__ xa) {
+#if STRATA_NAT_W12
+    const int64_t r = blockIdx.x;
+    const float* xr = x + r * cols;
+    __shared__ float red[256];
+    float m = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += 256) m = fmaxf(m, fabsf(xr[i]));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    const float ts = red[0] > 0.0f ? red[0] / 448.0f : 1.0f, inv = 1.0f / ts;
+    uint8_t* o = xa + r * (int64_t) (cols / 64) * AB;
+    for (int i = 4 * threadIdx.x; i < cols; i += 4 * 256) {
+        const float4 v = *reinterpret_cast<const float4*>(xr + i);
+        int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v.x * inv, v.y * inv, 0, false);
+        pk = __builtin_amdgcn_cvt_pk_fp8_f32(v.z * inv, v.w * inv, pk, true);
+        *reinterpret_cast<int*>(o + (i / 64) * AB + (i % 64)) = pk;
+    }
+    for (int k = threadIdx.x; k < cols / 64; k += 256) *reinterpret_cast<float*>(o + k * AB + 64) = ts;
+#else
+    __builtin_trap();
+#endif
+}
 #endif  // __HIPCC__
 
 
@@ -648,11 +874,11 @@ DeviceInfo device_info() {
     d.ready = true;
     cudaDeviceProp prop{};
     ck(cudaGetDeviceProperties(&prop, dev), "properties");
-    // Measured on gfx1151 and gfx1100; other compiled architectures retain MMQ until validated separately.  gfx1201
-    // (RDNA4, the R9700: its own WMMA layout above) runs it with STRATA_GLM_PREFILL_FUSED=1: its experts take less
-    // time than MMQ's, but a prompt there waits on the mixer, not on them, so it is not the default yet.
+    // Measured on gfx1151 and gfx1100, and on gfx1201 (RDNA4, the R9700: its own WMMA layout above, with the gate/up
+    // product in FP8 - f8_on); other compiled architectures retain MMQ until validated separately.
+    // STRATA_GLM_PREFILL_FUSED=0 keeps MMQ on gfx1201 too.
     const char* want = std::getenv("STRATA_GLM_PREFILL_FUSED");
-    const bool rdna4_on = want != nullptr && want[0] == '1' && !std::strncmp(prop.gcnArchName, "gfx1201", 7);
+    const bool rdna4_on = !(want != nullptr && want[0] == '0') && !std::strncmp(prop.gcnArchName, "gfx1201", 7);
     if (std::strncmp(prop.gcnArchName, "gfx1151", 7) && std::strncmp(prop.gcnArchName, "gfx1100", 7) && !rdna4_on)
         return d;
     hipFuncAttributes fa{};
@@ -680,9 +906,24 @@ bool available() {
     return d.ok;
 }
 
+// the gate/up product in FP8 (native_f8gu_kernel) on gfx1201 (the R9700) unless STRATA_GLM_PREFILL_F8=0: checked with
+// STRATA_GLM_KL_DUMP, the change is within the model's own run-to-run spread
+bool f8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GLM_PREFILL_F8");
+        if (v && v[0] == '0') return false;
+        int dev = 0;
+        cudaDeviceProp prop{};
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+               !std::strncmp(prop.gcnArchName, "gfx1201", 7);
+    }();
+    return on;
+}
+
 bool supported(int gu, int down) {
     if (!(gu == T_IQ2_XXS || gu == T_IQ2_XS || gu == T_IQ2_S || gu == T_IQ3_XXS || gu == T_IQ3_S || gu == T_IQ4_XS) ||
         !(down == T_Q2_0 || down == T_IQ4_NL || down == T_IQ2_S || down == T_IQ3_XXS)) return false;
+    if (f8_on() && !f8_gu_type(gu)) return false;   // (the activations go in E4M3 for every fused layer)
     return available();
 }
 
@@ -690,6 +931,11 @@ size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) (
 
 void quantize(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
     if (rows <= 0) return;
+    if (f8_on()) {
+        quant_act_f8_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, (int) cols, (uint8_t*) xa);
+        ck(cudaGetLastError(), "quantize f8");
+        return;
+    }
     const int64_t nblk = rows * (cols / 64);
     quant_act_nat_kernel<<<(unsigned)((nblk + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, nblk, (uint8_t*) xa);
     ck(cudaGetLastError(), "quantize");
@@ -712,7 +958,8 @@ void experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int ne,
     const auto s = (cudaStream_t) stream;
     auto* tiles = (int2*) tile_scratch;
     make_tiles_kernel<<<1, 256, 0, s>>>(bounds, ne, tiles);
-#define GU(T) native_kernel<T, true, true, NW_LB><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr)
+#define GU(T) do { if (f8_on()) native_f8gu_kernel<T, true, NW_LB><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha); \
+                   else native_kernel<T, true, true, NW_LB><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr); } while (0)
     switch (geo.gu_type) {
         case T_IQ2_XXS: GU(T_IQ2_XXS); break;
         case T_IQ2_XS: GU(T_IQ2_XS); break;
