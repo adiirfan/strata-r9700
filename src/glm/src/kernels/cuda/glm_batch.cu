@@ -1778,6 +1778,9 @@ __device__ __forceinline__ int mla2_wmma_row(int i, int hi) {
 // through WMMA with FP32 accumulation, retaining substantially more precision
 // than a single FP16 attention product. FP16 latents are loaded directly;
 // INT8 records are expanded to the same FP16 tile, shared by QK and PV.
+// SPLIT = false (STRATA_GLM_MLA_SPLIT=0): the query and the probabilities as one FP16 operand each, not high +
+// residual - half the WMMA work, FP16's rounding on q (scaled to its row's exponent) and on p in [0, 1].
+template <bool SPLIT>
 __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
         const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
         const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
@@ -1825,7 +1828,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
         for (int k = 0; k < 4; ++k) {
             const mla2_h16 b = *(const mla2_h16*)(&sl[l16][wave * 64 + 16 * k]);
             dot = mla2_wmma(qh[k], b, dot);
-            dot = mla2_wmma(ql[k], b, dot);
+            if constexpr (SPLIT) dot = mla2_wmma(ql[k], b, dot);
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -1862,7 +1865,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
 #pragma unroll
             for (int k = 0; k < 16; ++k) b[k] = sl[k][wave * 64 + nt * 16 + l16];
             acc[nt] = mla2_wmma(a_hi, b, acc[nt]);
-            acc[nt] = mla2_wmma(a_lo, b, acc[nt]);
+            if constexpr (SPLIT) acc[nt] = mla2_wmma(a_lo, b, acc[nt]);
         }
     }
     __syncthreads();
@@ -1876,6 +1879,146 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
             const float inv = denom[r] > 0 ? 1 / denom[r] : 0;
             ctx[((size_t)t * n_head + h0 + r) * 512 + wave * 64 + nt * 16 + l16] = acc[nt][i] * inv;
         }
+}
+
+// mla_attn_wmma2_kernel's arithmetic on gfx12 (RDNA4) with the latent tiles moved better: the next 16 cells' latents
+// are read into registers while this step computes (one barrier fewer: the cells' validity rides with them), and the
+// tile's rows are padded (MLA3_LD) so the QK product's B reads - a row per lane - fall in different LDS banks instead of
+// all in one.  The same WMMA products in the same order: bit-identical output.
+constexpr int MLA3_LD = 520;
+template <bool SPLIT, int HG>
+__global__ void __launch_bounds__(256) mla_attn_wmma3_kernel(
+        const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+        const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
+        int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __shared__ __align__(16) _Float16 sl[16][MLA3_LD];
+    __shared__ __align__(16) _Float16 ph[HG][16][16], pl[HG][16][16];
+    __shared__ float scores[HG][8][16][16], qi[HG][8][16];
+    __shared__ float sm[HG * 16], denom[HG * 16], rescale[HG * 16];
+    __shared__ int valid[16];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int t = blockIdx.x, h0 = blockIdx.y * 16 * HG, ns = n_sel_arr[t];
+    const int* cl = cells_all + (size_t)t * n_sel_max;
+    mla2_h16 qh[HG][4], ql[HG][SPLIT ? 4 : 1];
+#pragma unroll
+    for (int g = 0; g < HG; ++g) {
+        const float* qr = q_abs + ((size_t)t * n_head + h0 + 16 * g + l16) * 512 + wave * 64;
+        float mx = 0;
+#pragma unroll
+        for (int k = 0; k < 64; ++k) mx = fmaxf(mx, fabsf(qr[k]));
+        int ex = 0;
+        if (mx > 0) { frexpf(mx, &ex); ex = max(-60, min(60, 14 - ex)); }
+        const float f = ldexpf(1.0f, ex);
+        if (hi == 0) qi[g][wave][l16] = ldexpf(1.0f, -ex);
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const float v = qr[16 * k + j] * f;
+                qh[g][k][j] = (_Float16)v;
+                if constexpr (SPLIT) ql[g][k][j] = (_Float16)(v - (float)qh[g][k][j]);
+            }
+    }
+    mla2_f8 acc[HG][4] = {};
+    if (tid < 16 * HG) { sm[tid] = -INFINITY; denom[tid] = 0; }
+    // this thread's share of a 16-cell tile: 4 pieces of 8 latent values (row i / 64, columns (i % 64) * 8 ..)
+    uint4 pf[4];
+    auto fetch = [&](int s0) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + 256 * j, r = i / 64, col = (i % 64) * 8;
+            const int cell = s0 + r < ns ? cl[s0 + r] : -1;
+            pf[j] = cell < 0 ? make_uint4(0, 0, 0, 0)
+                  : q8 ? lat8_h8(lat8_rec(lat, 512, cell), 512, col / 8)
+                       : *(const uint4*)(lat + (size_t)cell * 512 + col);
+        }
+    };
+    if (ns > 0) fetch(0);
+    for (int s0 = 0; s0 < ns; s0 += 16) {
+        __syncthreads();                       // the previous step is done with the tiles and the probabilities
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + 256 * j, r = i / 64, col = (i % 64) * 8;
+            *(uint4*)(&sl[r][col]) = pf[j];
+        }
+        if (tid < 16) valid[tid] = s0 + tid < ns;
+        __syncthreads();
+        if (s0 + 16 < ns) fetch(s0 + 16);      // in flight while this step computes
+#pragma unroll
+        for (int g = 0; g < HG; ++g) {
+            mla2_f8 dot = {};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const mla2_h16 b = *(const mla2_h16*)(&sl[l16][wave * 64 + 16 * k]);
+                dot = mla2_wmma(qh[g][k], b, dot);
+                if constexpr (SPLIT) dot = mla2_wmma(ql[g][k], b, dot);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = mla2_wmma_row(i, hi);
+                scores[g][wave][row][l16] = dot[i] * qi[g][wave][row];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int g = 0; g < HG; ++g) {
+            const int r = tid >> 4, col = tid & 15;
+            float v = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) v += scores[g][w][r][col];
+            v = !valid[col] ? -INFINITY : v * scale;
+            float m = v;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            const int R = 16 * g + r;
+            const float old_m = sm[R], new_m = fmaxf(old_m, m);
+            const float p = v == -INFINITY ? 0 : expf(v - new_m);
+            float sum = p;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            ph[g][r][col] = (_Float16)p;
+            pl[g][r][col] = (_Float16)(p - (float)ph[g][r][col]);
+            if (col == 0) {
+                const float sc = old_m == -INFINITY ? 0 : expf(old_m - new_m);
+                rescale[R] = sc; denom[R] = denom[R] * sc + sum; sm[R] = new_m;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            // B: cells 8 hi .. 8 hi + 7 of latent column wave * 64 + 16 nt + l16 (mla2_wmma reads b[8 hi + i])
+            mla2_h16 b = {};
+#pragma unroll
+            for (int k = 0; k < 8; ++k) b[8 * hi + k] = sl[8 * hi + k][wave * 64 + nt * 16 + l16];
+#pragma unroll
+            for (int g = 0; g < HG; ++g) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[g][nt][i] *= rescale[16 * g + mla2_wmma_row(i, hi)];
+                const mla2_h16 a_hi = *(const mla2_h16*)ph[g][l16];
+                acc[g][nt] = mla2_wmma(a_hi, b, acc[g][nt]);
+                if constexpr (SPLIT) {
+                    const mla2_h16 a_lo = *(const mla2_h16*)pl[g][l16];
+                    acc[g][nt] = mla2_wmma(a_lo, b, acc[g][nt]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < HG; ++g)
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            asm volatile("" :: "v"(acc[g][nt][i]));
+            const int r = 16 * g + mla2_wmma_row(i, hi);
+            const float inv = denom[r] > 0 ? 1 / denom[r] : 0;
+            ctx[((size_t)t * n_head + h0 + r) * 512 + wave * 64 + nt * 16 + l16] = acc[g][nt][i] * inv;
+        }
+#else
+    __builtin_trap();
+#endif
 }
 
 // Per device, the wave32 WMMA path: 0 not probed yet, 1 gfx12, 2 other gfx11 (gfx1100/1101/1102/1150),
@@ -2621,7 +2764,28 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
         return;
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head / 16));
-    mla_attn_wmma2_kernel<<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+    // gfx12: mla_attn_wmma3_kernel - two head tiles a block, the next tile prefetched (STRATA_GLM_MLA_V3=0: the
+    // original kernel), and q and p as one FP16 operand each: half the WMMA work for a change the size of the model's
+    // run-to-run spread (STRATA_GLM_KL_DUMP; STRATA_GLM_MLA_SPLIT=1 keeps the high + residual products, bit-identical
+    // to the original kernel).  Elsewhere the split stays the default.
+    static const bool v3 = mla_wmma2_arch() == 1 && [] { const char* v = std::getenv("STRATA_GLM_MLA_V3"); return !(v && v[0] == '0'); }();
+    static const bool split = [] {
+        const char* v = std::getenv("STRATA_GLM_MLA_SPLIT");
+        return v ? v[0] != '0' : !v3;
+    }();
+    // STRATA_GLM_MLA_HG: head tiles of 16 per block (1, 2 or 4; n_head must divide)
+    static const int hg = [] { const char* v = std::getenv("STRATA_GLM_MLA_HG"); const int x = v ? std::atoi(v) : 2; return x == 4 ? 4 : x == 1 ? 1 : 2; }();
+    if (v3 && n_head % (16 * hg) == 0) {
+        const dim3 g3((unsigned) T, (unsigned) (n_head / (16 * hg)));
+#define MLA3(S, H) mla_attn_wmma3_kernel<S, H><<<g3, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8)
+        if (hg == 4) { if (split) MLA3(true, 4); else MLA3(false, 4); }
+        else if (hg == 2) { if (split) MLA3(true, 2); else MLA3(false, 2); }
+        else { if (split) MLA3(true, 1); else MLA3(false, 1); }
+#undef MLA3
+    } else if (split)
+        mla_attn_wmma2_kernel<true><<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+    else
+        mla_attn_wmma2_kernel<false><<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
     check("mla_attn_wmma2");
 }
 #endif
