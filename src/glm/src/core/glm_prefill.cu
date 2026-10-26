@@ -2102,6 +2102,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             else
                 strata::kernels::dequant_f16(w.type, w.q, r0, n, Kd, S->w16, s);
 #if defined(STRATA_USE_HIP)
+            // STRATA_GLM_PF_FP8=1: the product in FP8 E4M3 (Gemm::f16_fp8; prompts' sub-batches of 256+ rows)
+            static const bool pf_fp8 = [] { const char* v = getenv("STRATA_GLM_PF_FP8"); return v != nullptr && v[0] == '1'; }();
+            if (pf_fp8 && S->lt && ldx == Kd && Tn >= 256 && S->lt->f16_fp8(X16, S->w16, Y + r0, Tn, n, Kd, ldy, beta))
+                continue;
             if (S->lt && ldx == Kd) {
                 S->lt->f16(X16, S->w16, Y + r0, Tn, n, Kd, ldy, beta);
                 continue;

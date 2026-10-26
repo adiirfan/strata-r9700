@@ -33,6 +33,11 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
+    /// Y = X . W^T as FP8 E4M3 on both sides, W in FP16 in this object's scratch (it is used for the activations after);
+    /// hipBLASLt only (STRATA_HIPBLASLT_TUNING).  False, nothing launched: the caller takes f16().
+    bool f16_fp8(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+                 float beta = 0.0f);
+
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f);
@@ -52,6 +57,13 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    uint8_t* fp8_w_ = nullptr;      // f16_fp8: the weight in E4M3
+    int64_t fp8_w_bytes_ = 0;
+    float* fp8_vec_ = nullptr;      // per weight row: its scale, then the product's alpha (row scale x activation scale)
+    int64_t fp8_vec_rows_ = 0;
+    uint32_t* fp8_amax_ = nullptr;  // the activation slice's largest |x| (float bits)
+    bool fp8_failed_ = false;
+    void* fp8_cache_ = nullptr;     // descriptors and algorithm per shape
 };
 
 
