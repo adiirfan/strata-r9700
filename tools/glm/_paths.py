@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-ENGINE = Path(__file__).resolve().parents[1]
+ENGINE = Path(__file__).resolve().parents[2]   # (Strata: tools/glm/ is two levels below the checkout)
 
 
 def gguf_py() -> str:
