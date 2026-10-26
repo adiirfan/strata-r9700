@@ -150,6 +150,23 @@ __global__ void bf16_to_f16(const uint16_t* __restrict__ src, uint16_t* __restri
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         dst[i] = __half_as_ushort(__float2half(__uint_as_float((uint32_t) src[i] << 16)));
 }
+// sgemm_bf16 on HIP: x (FP32 rows of K, row stride ldx) as two BF16 parts, x ~= hi + lo (round to nearest even
+// each), so that two BF16 products with an FP32 accumulator give the FP32 product to about 16 bits of x
+__device__ __forceinline__ uint16_t f32_bf16_rne(float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+__global__ void split_bf16_kernel(const float* __restrict__ x, int64_t ldx, int K, int rows, uint16_t* __restrict__ hi,
+                                  uint16_t* __restrict__ lo) {
+    const int64_t n = (int64_t) rows * K;
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const float f = x[(i / K) * ldx + i % K];
+        const uint16_t h = f32_bf16_rne(f);
+        hi[i] = h;
+        lo[i] = f32_bf16_rne(f - __uint_as_float((uint32_t) h << 16));
+    }
+}
 bool env_on(const char* name) {
     const char* v = getenv(name);
     return !(v && v[0] == '0');
@@ -2003,6 +2020,34 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // Y[t][N] (row stride ldy) = alpha * X[t][K] (F32, row stride ldx) . W[N][K]^T, W BF16 (widened in slices)
     const auto sgemm_bf16 = [&](const uint16_t* W, int N, int Kd, const float* X, int ldx, float* Y, int ldy, int Tn,
                                 float alpha) {
+#if defined(STRATA_USE_HIP)
+        // ROCm 10's FP32 GEMM (rocBLAS sgemm, and GemmEx with FP32 operands) costs ~18 ms a call on gfx1201 whatever the
+        // shape - the KDA low-rank projections were 56% of a 16K prompt.  The BF16 weight as it is, x split in two BF16
+        // parts (split_bf16_kernel): two BF16 products, FP32 accumulate, in blocks of the tokens the FP32 weight
+        // scratch holds (it is not needed for a widened weight here).  STRATA_GLM_SGEMM_F32=1: the FP32 product.
+        static const bool f32 = getenv("STRATA_GLM_SGEMM_F32") != nullptr && std::atoi(getenv("STRATA_GLM_SGEMM_F32")) != 0;
+        if (!f32) {
+            uint16_t* const hi = (uint16_t*) S->w32;
+            const int rows_t = (int) std::max<int64_t>(1, std::min<int64_t>(Tn, S->w32_elems / Kd));
+            uint16_t* const lo = hi + (size_t) rows_t * Kd;
+            for (int t0 = 0; t0 < Tn; t0 += rows_t) {
+                const int tn = std::min(rows_t, Tn - t0);
+                const int64_t n = (int64_t) tn * Kd;
+                split_bf16_kernel<<<(unsigned) std::min<int64_t>((n + 255) / 256, 4096), 256, 0, s>>>(
+                    X + (size_t) t0 * ldx, ldx, Kd, tn, hi, lo);
+                for (int part = 0; part < 2; ++part) {
+                    const float b = part == 0 ? 0.0f : 1.0f;
+                    const cublasStatus_t st = cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, tn, Kd, &alpha, W,
+                                                           CUDA_R_16BF, Kd, part == 0 ? hi : lo, CUDA_R_16BF, Kd, &b,
+                                                           Y + (size_t) t0 * ldy, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
+                                                           CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    gemm_fail(st, "gemm bf16x2", W, part == 0 ? hi : lo, Y + (size_t) t0 * ldy, N, tn, Kd, Kd, Kd, ldy);
+                    blas_ck(st, "gemm bf16x2");
+                }
+            }
+            return;
+        }
+#endif
         const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w32_elems / Kd));
         for (int r0 = 0; r0 < N; r0 += rows) {
             const int n = std::min(rows, N - r0);
@@ -2484,14 +2529,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.q, DI, E, x16, E, B.proj[0], DI, tn, 0.0f);
                 hgemm_q(Ly.k, DI, E, x16, E, B.proj[1], DI, tn, 0.0f);
                 hgemm_q(Ly.v, DI, E, x16, E, B.proj[2], DI, tn, 0.0f);
+                S->mark("kda_qkv", s);
                 sgemm_bf16(Ly.f_a, HD, E, xs, E, B.fa, HD, tn, 1.0f);
                 sgemm_bf16(Ly.g_a, HD, E, xs, E, B.ga, HD, tn, 1.0f);
                 sgemm_bf16(Ly.beta, g.n_head, E, xs, E, B.beta, g.n_head, tn, 1.0f);
+                S->mark("kda_low", s);
                 const float* pr[3] = {B.proj[0], B.proj[1], B.proj[2]};
                 float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
                 float* cst = state_ + kda_conv_[(size_t) il];
                 gb::kda_conv(pr, Ly.conv, cst, cv, tn, DI, g.d_conv, s);
                 gb::kda_conv_state(pr, cst, tn, DI, g.d_conv, s);
+                S->mark("kda_conv", s);
                 sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
                 sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
                 S->mark("kda_proj", s);
