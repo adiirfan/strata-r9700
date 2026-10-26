@@ -1,7 +1,7 @@
-# strata-r9700: DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, Nemotron 3.5 Bolt and Recursive Flint on one Radeon AI PRO R9700
+# strata-r9700: DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Nemotron 3.5 Bolt and Recursive Flint on one Radeon AI PRO R9700
 
 This is [Strata](https://github.com/Niko1221/Strata) 0.2.4 (commit `96ca4383`) tuned for a 32 GB Radeon AI PRO R9700,
-with three more models beside Strata's own. Every model works behind Strata's server, which offers OpenAI- and
+with four more models beside Strata's own. Every model works behind Strata's server, which offers OpenAI- and
 Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.md](README-STRATA.md).
 
 - **Qwen3.8-Flash-Next** is Strata's own model. This repo adds the R9700 work from
@@ -9,6 +9,9 @@ Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.m
   is pinned only as a conversation grows, and experts given back from RAM after a long prompt.
 - **DeepSeek-V4.1-Flash**: Strata 0.2.4 carries its engine (`src/dsv41/`, from Project Maya). This repo tunes it for
   this card and a fast SSD and lets the server pass it pictures.
+- **GLM-5.3-Flash**: Project Maya's GLM engine (v1.1.28), built here as `engine/strata-glm` (`src/glm/`), with the
+  server, the tokenizer and the picture encoder taught GLM's ways, and its prompt path made several times faster on
+  this card.
 - **Nemotron 3.5 Bolt, Recursive Flint and Ling-3.0-flash** are programs of their own. (This repo was `strata-nemo`,
   built on an older Strata. Nemotron, with and without its drafter, and Flint give the same output, token for token, on
   0.2.4 as before. Ling builds, but its model was not on hand for these measurements.)
@@ -16,6 +19,7 @@ Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.m
 | Program | Model | Weights | Where they live | Context | Code |
 | --- | --- | --- | --- | ---: | --- |
 | `engine/strata-dsv41` | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), [ISTA-DASLab's 2-bit GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | 138 GB + 111 GB of Engram tables | card + RAM + SSD | 262,144 | `src/dsv41/`, `serve/ds4_images.py` |
+| `engine/strata-glm` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) 321B-A18B, [Maya-M-Derisked IQ2_S GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF) (fewer blanket refusals), vision files from [the Maya release](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) | 116 GB, of it 97 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `src/glm/`, `tools/glm/`, `tools/vision/glm5next*` |
 | `engine/strata-r9700` | [Qwen3.8-Flash-Next](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) (SC117's abliterated GSQ-RCO IQ3_S) | 79 GB, of it 50 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `src/core/`, `src/prefill/`, `src/program/` |
 | `engine/strata-nemo` | [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB), with the [LiLiCorr drafter](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) | 24 GB | all on the card | 262,144 | `src/nemotron/` |
 | `engine/strata-flint` | [Recursive Flint 40B-A2.5B](https://huggingface.co/RecursiveSI/flint), [Q4_1 GGUF](https://huggingface.co/RecursiveSI/flint-int4-gguf) | 26 GB | all on the card | 262,144 | `src/flint/` |
@@ -38,6 +42,9 @@ own counts in tokens per second; first-token times are measured by the client.
 - **DeepSeek:** the leave-out setting at 0.20 and 24K prompt chunks (see [DeepSeek-V4.1-Flash](#deepseek-v41-flash)).
   *72 GB store*: a 72 GB RAM store, no cap (about 80 GB of RAM in all). *48 GB cap* and *32 GB cap*: the whole server
   held to that much RAM by the system (systemd `MemoryMax`), with a 38 GB and a 21 GB store.
+- **GLM:** the leave-out setting at 0.12 on every layer and prompt chunks of up to 32K tokens (see
+  [GLM-5.3-Flash](#glm-53-flash)). *All in RAM*: every expert on the card or in RAM bar a few on the SSD (about 83 GB in
+  all). *48 GB cap* and *32 GB cap*: the whole server held to that much RAM, with a 36 GB and a 24 GB expert store.
 - **Qwen:** *all in RAM*: every expert in RAM (about 55 GB). *32 GB cap* and *16 GB cap*: the whole server held to that
   much RAM, with 20 GB and 5 GB of experts in RAM and the rest read from the SSD.
 - **Nemotron:** with its drafter. **Flint:** with the server's guessing ahead.
@@ -47,19 +54,19 @@ own counts in tokens per second; first-token times are measured by the client.
 
 ### Strata's benchmark
 
-| Test | DeepSeek, 72 GB store | DeepSeek, 48 GB cap | DeepSeek, 32 GB cap | Qwen, all in RAM | Qwen, 32 GB cap | Qwen, 16 GB cap | Nemotron | Flint |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Chat: writing (tokens/s) | 17.9 | 15.3 | 12.0 | 78.3 | 60.1 | 40.9 | 124.4 | 238.0 |
-| Chat: first token | 2.67 s | 3.28 s | 4.05 s | 0.49 s | 0.57 s | 0.89 s | 0.12 s | 0.07 s |
-| 4K prompt: reading (tokens/s) | 720 | 595 | 506 | 2,332 | 1,382 | 504 | 4,930 | 6,829 |
-| 4K prompt: first token | 5.73 s | 6.94 s | 8.15 s | 1.75 s | 2.93 s | 7.99 s | 0.84 s | 0.60 s |
-| 16K prompt: reading (tokens/s) | 1,176 | 1,286 | 1,218 | 3,246 | 2,692 | 1,587 | 5,237 | 6,506 |
-| 16K prompt: first token | 14.11 s | 12.90 s | 13.61 s | 4.98 s | 6.00 s | 10.15 s | 3.16 s | 2.54 s |
-| 32K prompt: reading (tokens/s) | 1,064 | 1,389 | 1,326 | 3,380 | 2,708 | 2,120 | 4,990 | 5,721 |
-| 32K prompt: first token | 31.18 s | 23.89 s | 25.01 s | 9.52 s | 11.87 s | 15.16 s | 6.62 s | 5.76 s |
-| Agent session: prompt reused | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 68% |
-| Agent session: first token per turn | 9.89 s | 12.52 s | 15.01 s | 1.60 s | 2.79 s | 7.55 s | 0.62 s | 0.46 s |
-| Agent session: writing (tokens/s) | 12.5 | 12.9 | 11.7 | 76.6 | 71.6 | 58.9 | 97.5 | 206.5 |
+| Test | DeepSeek, 72 GB store | DeepSeek, 48 GB cap | DeepSeek, 32 GB cap | GLM, all in RAM | GLM, 48 GB cap | GLM, 32 GB cap | Qwen, all in RAM | Qwen, 32 GB cap | Qwen, 16 GB cap | Nemotron | Flint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Chat: writing (tokens/s) | 17.9 | 15.3 | 12.0 | 28.4 | 22.1 | 17.8 | 78.3 | 60.1 | 40.9 | 124.4 | 238.0 |
+| Chat: first token | 2.67 s | 3.28 s | 4.05 s | 1.35 s | 2.87 s | 4.05 s | 0.49 s | 0.57 s | 0.89 s | 0.12 s | 0.07 s |
+| 4K prompt: reading (tokens/s) | 720 | 595 | 506 | 884 | 436 | 347 | 2,332 | 1,382 | 504 | 4,930 | 6,829 |
+| 4K prompt: first token | 5.73 s | 6.94 s | 8.15 s | 4.61 s | 9.28 s | 11.66 s | 1.75 s | 2.93 s | 7.99 s | 0.84 s | 0.60 s |
+| 16K prompt: reading (tokens/s) | 1,176 | 1,286 | 1,218 | 989 | 968 | 921 | 3,246 | 2,692 | 1,587 | 5,237 | 6,506 |
+| 16K prompt: first token | 14.11 s | 12.90 s | 13.61 s | 19.07 s | 16.71 s | 17.60 s | 4.98 s | 6.00 s | 10.15 s | 3.16 s | 2.54 s |
+| 32K prompt: reading (tokens/s) | 1,064 | 1,389 | 1,326 | 977 | 966 | 908 | 3,380 | 2,708 | 2,120 | 4,990 | 5,721 |
+| 32K prompt: first token | 31.18 s | 23.89 s | 25.01 s | 35.77 s | 33.42 s | 35.54 s | 9.52 s | 11.87 s | 15.16 s | 6.62 s | 5.76 s |
+| Agent session: prompt reused | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 68% |
+| Agent session: first token per turn | 9.89 s | 12.52 s | 15.01 s | 4.34 s | 9.32 s | 11.59 s | 1.60 s | 2.79 s | 7.55 s | 0.62 s | 0.46 s |
+| Agent session: writing (tokens/s) | 12.5 | 12.9 | 11.7 | 25.8 | 21.0 | 17.4 | 76.6 | 71.6 | 58.9 | 97.5 | 206.5 |
 
 - Nemotron's writing moves with how many of the drafter's guesses the model keeps (105-221 tokens/s over the chats).
 - The agent session reuses 69% of each turn's prompt from the conversation cache in every setup, so its first-token
@@ -106,6 +113,42 @@ model's own tokenizer made of it.
 | 64K (63,685) | 956 | 67.0 s | 12.0 | 14.8 |
 | 128K (123,616) | 829 | 150.0 s | 12.0 | 14.6 |
 | 256K (231,917) | 1,024 | 227.7 s | 12.6 | 14.8 |
+
+#### GLM, all in RAM
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,076) | 287 | 3.9 s | 24.5 | 26.7 |
+| 4K (4,176) | 843 | 5.1 s | 25.9 | 26.0 |
+| 16K (14,724) | 991 | 15.0 s | 25.6 | 25.6 |
+| 32K (30,537) | 978 | 31.4 s | 24.6 | 25.6 |
+| 64K (63,822) | 951 | 69.8 s | 25.2 | 25.3 |
+| 128K (123,356) | 902 | 149.5 s | 24.0 | 23.8 |
+| 256K (231,868) | 818 | 296.7 s | 22.8 | 22.8 |
+
+#### GLM, 48 GB cap
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,075) | 117 | 9.3 s | 19.3 | 19.8 (721 written) |
+| 4K (4,177) | 447 | 9.5 s | 19.4 | 20.5 |
+| 16K (14,725) | 940 | 15.8 s | 17.7 | 20.0 |
+| 32K (30,536) | 936 | 32.8 s | 17.9 | 19.0 |
+| 64K (63,822) | 920 | 69.7 s | 18.0 | 19.0 |
+| 128K (123,356) | 882 | 140.6 s | 16.6 | 18.7 |
+| 256K (231,868) | 801 | 299.0 s | 16.1 | 15.6 (41 written) |
+
+#### GLM, 32 GB cap
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,075) | 91 | 11.9 s | 16.6 | 16.3 (824 written) |
+| 4K (4,176) | 357 | 11.8 s | 15.3 | 16.6 |
+| 16K (14,725) | 859 | 17.3 s | 15.8 | 15.5 |
+| 32K (30,536) | 867 | 36.4 s | 15.6 | 15.6 |
+| 64K (63,820) | 856 | 74.9 s | 15.1 | 15.9 |
+| 128K (123,354) | 841 | 147.3 s | 14.2 | 15.1 |
+| 256K (231,867) | 775 | 301.4 s | 11.9 | 14.2 |
 
 #### Qwen, all in RAM
 
@@ -170,6 +213,10 @@ model's own tokenizer made of it.
 - **DeepSeek's writing hardly moves with the prompt's length:** what limits it is how many experts per word come from
   the SSD, not the context. Its prompts start slowly because every chunk streams the experts the card does not hold,
   about 110 GB, so a short prompt pays for one whole pass.
+- **GLM writes faster than DeepSeek at every RAM size** (it leaves out light experts on every layer, and most of what
+  it needs fits on the card and in RAM), and reads long prompts a little slower: its 34 KDA and 11 DSA layers cost more
+  per token than DeepSeek's attention. With a cap its short prompts slow down like Qwen's, while from 16K on it
+  loses little.
 - **With less RAM,** Qwen's short prompts slow down most (the experts they need come from the SSD); long prompts share
   each pass over the experts among more tokens and lose less.
 
@@ -197,6 +244,62 @@ table of 111 GB that each token reads 48 rows of) and a vision tower. The 2-bit 
 - **Pictures** go through Strata's server like the Qwen models'. The vision tower comes from DeepSeek's own checkpoint
   (shard 1 of 48, 0.97 GB, see [Build](#build)); the server resizes each picture as DeepSeek's `image_processor.py`
   does and the engine encodes it.
+
+## GLM-5.3-Flash
+
+GLM-5.3-Flash has 45 layers: 34 KDA layers (a recurrent attention with a fixed-size state) and 11 DSA layers (attention
+over the 2,048 earlier positions its indexer picks), 64 heads, and 42 expert layers of 288 experts, 8 used per token,
+beside a shared expert. The Maya-M-Derisked GGUF keeps its experts in 2-3 bits (97 GB, about 8 MB an expert) and the
+rest in Q6_K (about 7 GB on the card).
+
+**What this repo changes,** each measured on this desktop with fresh prompts through the server (all in RAM):
+
+| Change | Chat: first token | 4K prompt | 16K prompt |
+| --- | ---: | ---: | ---: |
+| Maya's engine as it is | 7.0 s | 213 tok/s | 221 tok/s |
+| FP32 products as two BF16 parts | 1.0 s | 757 | 798 |
+| DSA attention: two head tiles a block, one FP16 pass | 1.0 s | 810 | 960 |
+| Prompt experts: the fused kernel, gate/up in FP8 | 1.0 s | 860 | 1,015 |
+
+- **FP32 products:** on this ROCm (10.2.0a20261009) an FP32 matrix product (rocBLAS sgemm, or GemmEx with FP32 operands)
+  takes about 18 ms a call on gfx1201 whatever its size; the same product in BF16 takes 0.02-0.06 ms. GLM's prompt path
+  ran its KDA projections, stream mixing, indexer and router through it. Each FP32 input is now split into two BF16
+  parts (`STRATA_GLM_SGEMM_F32=1` keeps the FP32 product). DeepSeek's prompt path had one such call (its stream mixing):
+  a short chat's first token there went from about 2.9 to 1.4 s (`DS4_HC_MIX_F32=1` keeps it).
+- **DSA attention** (`STRATA_GLM_MLA_V3=0` and `STRATA_GLM_MLA_SPLIT=1` restore the original): each block loads a tile
+  of stored keys once for 32 heads instead of 16, reads the next tile while it computes, and does each product once in
+  FP16 instead of twice (high part + residual).
+- **Prompt experts** (`STRATA_GLM_PREFILL_FUSED=0`, `STRATA_GLM_PREFILL_F8=0`): Maya's fused expert kernel had its RDNA4
+  code but was only switched on for RDNA3; here it runs on the R9700 with its gate/up product on the FP8 matrix cores,
+  as Qwen's `STRATA_PF_FUSED_F8`.
+- **Output:** every change above was checked by teacher-forcing 128 tokens after a 1,920-token prompt
+  (`STRATA_GLM_KL_DUMP`) against the unchanged engine: KL divergence 0.011-0.015, about the same as two runs of the unchanged
+  engine (0.010) - the engine is not bit-for-bit repeatable run to run.
+- **The server:** GLM's tokenizer (digits in threes, whole-vocabulary pieces kept; the same ids as llama.cpp on a
+  30,000-character document), its chat template and thinking levels (low, high, max, or off), its tool calls, and its
+  pictures (`<|begin_of_image|>` markers; the encoder gives GLM's picture tokens as one row, not a grid).
+
+**Leaving out light experts** (`STRATA_GLM_MISS_SKIP_W`, `STRATA_GLM_MISS_SKIP_FROM`): an expert that is not on the card
+and whose routing weight is under the setting is left out of that token instead of fetched from RAM or the SSD.
+Writing 400 tokens, all in RAM, against the unchanged model (the KL test above; two runs of it give 0.010):
+
+| Setting | Writing | Same next token | KL | Next-token loss |
+| --- | ---: | ---: | ---: | ---: |
+| off | 17.5 tok/s | 92% | 0.010 | 2.87 |
+| 0.12 from layer 23 | 22.0 | 85% | 0.020 | 2.92 |
+| 0.10 from layer 0 | 25.1 | 84% | 0.035 | 2.91 |
+| **0.12 from layer 0** (the tables above) | **28.2** | 85% | 0.048 | 2.94 |
+| 0.16 from layer 0 | 31.7 | 73% | 0.177 | 3.08 |
+
+- **Why writing stops there:** every word reads all of GLM's always-used weights, about 6.9 GB (the attention layers in
+  Q6_K), about 27 ms of the card's own work; the rest is experts copied from RAM. On this desktop the R9700 runs at
+  PCIe 5.0 x8 (the second graphics card shares the processor's lanes), about 25 GB/s.
+- **With a RAM cap** the engine's own sizing is stopped by the system while loading: set the expert store
+  (`STRATA_GLM_RAM_GB`, with `STRATA_GLM_RAM_HEADROOM_GB=2`). The engine and the server need about 6.5 GB beside it, so
+  a 48 GB cap takes a 36 GB store and a 32 GB cap a 24 GB one. The 32 GB setup read a 256K-token prompt at 782 tok/s.
+- **Tried, no gain here:** the model's MTP drafts (forced, writing fell to 16 and 8 tok/s: each draft needs more
+  experts over PCIe), prefetching the next layer's experts, more CPU threads, int8 stored keys, and the dense products
+  in FP8 (`STRATA_GLM_PF_FP8=1`: the weights' conversion each batch costs what the faster product saves).
 
 ## Qwen3.8-Flash-Next
 
@@ -292,6 +395,8 @@ Build against AMD TheRock ROCm 10 (`pip install "rocm[libraries,devel,device-gfx
 ```sh
 tools/r9700/build-r9700.sh <ROCm 10 SDK dir>    # writes engine/strata-r9700 (Qwen)
 tools/r9700/build-dsv41.sh <ROCm 10 SDK dir>    # writes engine/strata-dsv41
+tools/r9700/build-glm.sh <ROCm 10 SDK dir>      # writes engine/strata-glm
+tools/r9700/build-vision-glm.sh <ROCm 10 SDK dir> <llama.cpp copy>   # GLM's picture encoder: build-vision-glm/bin/strata-vision-hip
 tools/r9700/build-nemo.sh <ROCm 10 SDK dir>     # writes engine/strata-nemo
 tools/r9700/build-flint.sh <ROCm 10 SDK dir>    # writes engine/strata-flint
 tools/r9700/build-ling.sh <ROCm 10 SDK dir>     # writes engine/strata-ling
@@ -313,6 +418,15 @@ cp data/dsv41/profile-2.00.bin <pack dir>/expert-profile.bin           # which e
 ```
 
 `tools/dsv41/download_gguf.json` lists every file with its size and checksum.
+
+**GLM's pack:** download the three `GLM-5.3-Flash-Maya-M-Derisked-IQ2_S` shards into one folder and, for pictures,
+`vision/mmproj-GLM-5.3-Flash-F16.gguf` and `vision/GLM-5.3-Flash-vocab.gguf` from the Maya release. The engine finds the
+GGUFs at `<pack>/..`, so the pack goes beside them (llama.cpp's `gguf-py` from the checkout at the pinned commit):
+
+```sh
+STRATA_GGUF_PY=<llama.cpp>/gguf-py python3 tools/glm/iq_pack.py --compat-bf16 \
+    --gguf <model dir>/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00001-of-00003.gguf --out <model dir>/pack
+```
 
 ## Run from the command line
 
@@ -421,6 +535,31 @@ DeepSeek's config names its pack instead of a model family (its tokenizer and ch
 - `DS4_AHEAD=1`: each layer guesses the next one's experts and starts reading them early.
 - `DS4_CHUNK=24576`: prompt chunks of 24,576 tokens (the default on a 28 GB card is 12,288). Long prompts read up to
   twice as fast; the larger buffers keep about 3 GB fewer experts on the card.
+
+GLM's config names `"arch": "glm5"`, which picks its tokenizer rules, chat template, tool calls and thinking words; its
+tokenizer is in the pack. The 48 GB and 32 GB setups add `"STRATA_GLM_RAM_GB": "36"` (or `"24"`) and
+`"STRATA_GLM_RAM_HEADROOM_GB": "2"` to `env` and run the server under that cap (`systemd-run -p MemoryMax=48G ...`):
+
+```json
+{
+  "exe": "<repo>/engine/strata-glm",
+  "args": ["--glm-pack", "<model dir>/pack", "--max-context", "262144", "--expert-cache", "auto", "--prefill", "auto",
+           "--kv-streaming", "on"],
+  "tokenizer": "<model dir>/pack/tokenizer",
+  "arch": "glm5",
+  "model_family": "glm5",
+  "model_name": "glm-5.3-flash",
+  "reasoning_effort": "high",
+  "lib_dirs": ["<ROCm 10 SDK dir>/lib", "<ROCm 10 SDK dir>/lib/rocm_sysdeps/lib", "<ROCm 10 SDK dir>/lib/llvm/lib"],
+  "port": 8080,
+  "backend": "hip",
+  "env": {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16", "STRATA_GLM_SPLIT": "0",
+          "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "8192",
+          "STRATA_GLM_MISS_SKIP_W": "0.12", "STRATA_GLM_MISS_SKIP_FROM": "0"},
+  "vision": {"exe": "<repo>/build-vision-glm/bin/strata-vision-hip", "mmproj": "<model dir>/vision/mmproj-GLM-5.3-Flash-F16.gguf",
+             "model": "<model dir>/vision/GLM-5.3-Flash-vocab.gguf", "gpu": true}
+}
+```
 
 Qwen's config, from Strata's own pack and MTP folder (see [README-STRATA.md](README-STRATA.md)); the *all in RAM*
 setup above:
