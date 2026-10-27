@@ -1,0 +1,965 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pagoda in the Garden of Falling Blossoms — voxel diorama</title>
+<style>
+  :root { --ink:#2a2118; --cream:#f7efe2; --gold:#c98a3c; --rose:#e0708f; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#0e1620; overflow:hidden;
+    font-family: Georgia, "Iowan Old Style", "Times New Roman", serif; }
+  canvas { display:block; width:100%; height:100%; }
+  .card {
+    position:fixed; left:22px; top:20px; pointer-events:none;
+    background:linear-gradient(180deg, rgba(247,239,226,.92), rgba(240,228,210,.78));
+    color:var(--ink); border:1px solid rgba(90,70,50,.35);
+    border-left:4px solid var(--gold);
+    padding:14px 18px 12px; max-width:330px;
+    box-shadow:0 10px 26px rgba(10,14,20,.35); border-radius:3px;
+  }
+  .title { font-size:21px; letter-spacing:.02em; line-height:1.1; }
+  .title b { color:#8e3a2a; }
+  .sub { font-size:12.5px; font-style:italic; color:#5b4636; margin-top:5px; letter-spacing:.03em; }
+  .rule { height:1px; background:linear-gradient(90deg, var(--gold), transparent); margin:9px 0 8px; }
+  .stats { font-size:11.5px; letter-spacing:.06em; color:#4a3a2c; font-variant-numeric:tabular-nums; }
+  .stats span { color:#8e3a2a; font-weight:bold; }
+  .legend { position:fixed; left:22px; bottom:20px; pointer-events:none;
+    display:flex; flex-wrap:wrap; gap:6px 12px; max-width:520px; }
+  .chip { font-size:11px; letter-spacing:.05em; color:#f3ead9; background:rgba(20,28,36,.55);
+    border:1px solid rgba(240,230,210,.22); padding:4px 8px 4px 6px; border-radius:12px;
+    display:flex; align-items:center; gap:6px; }
+  .dot { width:8px; height:8px; border-radius:2px; box-shadow:0 0 6px rgba(255,255,255,.25); }
+  .hint { position:fixed; right:22px; bottom:20px; pointer-events:none; font-size:11.5px;
+    letter-spacing:.07em; color:#efe3cf; background:rgba(20,28,36,.5); padding:7px 11px;
+    border:1px solid rgba(240,230,210,.2); border-radius:3px; }
+  .hint kbd { color:var(--gold); font-family:inherit; }
+  .sig { position:fixed; right:22px; top:20px; pointer-events:none; font-size:11px;
+    letter-spacing:.12em; color:#e7d8bf; text-transform:uppercase; opacity:.75; }
+  .err { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    color:#f7efe2; background:#0e1620; font-size:15px; padding:30px; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="card">
+  <div class="title">Pagoda in the <b>Garden of Falling Blossoms</b></div>
+  <div class="sub">a voxel diorama · five-tier pagoda, koi pond, torii &amp; cherry groves</div>
+  <div class="rule"></div>
+  <div class="stats"><span id="vox">0</span> voxels · <span id="fps">0</span> fps · <span id="tri">0</span> tris</div>
+</div>
+<div class="legend" id="legend"></div>
+<div class="hint">drag to orbit · <kbd>scroll</kbd> to zoom · click to scatter petals · <kbd>space</kbd> auto-orbit</div>
+<div class="sig">webgl2 · single file</div>
+<script>
+"use strict";
+/* =====================================================================
+   A voxel garden rendered with raw WebGL2 (no libraries).
+   Everything is instanced unit boxes: per-instance position, scale, colour,
+   baked ambient-occlusion, baked sun shadow, sway/water/spin animation flags.
+   ===================================================================== */
+
+/* ---------- small maths helpers ---------- */
+const clamp = (v,a,b)=> v<a?a:v>b?b:v;
+const TAU = Math.PI*2;
+function mulberry32(a){ return function(){ a|=0; a=(a+0x6D2B79F5)|0; let t=Math.imul(a^(a>>>15),1|a);
+  t=(t+Math.imul(t^(t>>>7),61|t))^t; return ((t^(t>>>14))>>>0)/4294967296; }; }
+const rnd = mulberry32(20260327);
+const rrange=(a,b)=> a+(b-a)*rnd();
+function hexc(s){ const n=parseInt(s.slice(1),16); return [((n>>16)&255)/255,((n>>8)&255)/255,(n&255)/255]; }
+function mix(a,b,t){ return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t]; }
+function jit(c,amt){ const k=1+(rnd()-0.5)*amt; return [clamp(c[0]*k,0,1),clamp(c[1]*k,0,1),clamp(c[2]*k,0,1)]; }
+function hash2(x,y){ let n=(x*374761393 + y*6612455)|0; n=(n^(n>>13))*1274126177|0; n=(n^(n>>16))|0;
+  return (n>>>0)/4294967296; }
+function noise(x,y){ const xi=Math.floor(x), yi=Math.floor(y), fx=x-xi, fy=y-yi;
+  const sx=fx*fx*(3-2*fx), sy=fy*fy*(3-2*fy);
+  const a=hash2(xi,yi), b=hash2(xi+1,yi), c=hash2(xi,yi+1), d=hash2(xi+1,yi+1);
+  return a*(1-sx)*(1-sy)+b*sx*(1-sy)+c*(1-sx)*sy+d*sx*sy; }
+function fbm(x,y){ return noise(x,y)*0.55 + noise(x*2.1+5,y*2.1-3)*0.3 + noise(x*4.3-9,y*4.3+7)*0.15; }
+
+/* ---------- palettes ---------- */
+const P = {
+  stone:   hexc('#9a9d9f'), stoneDark: hexc('#787c82'), stoneWarm: hexc('#b7ab97'),
+  gravel:  hexc('#cbb695'), sand:      hexc('#c9b18a'), mud: hexc('#8b8872'),
+  grass:   hexc('#4f8347'), grassLit:  hexc('#79a557'), moss: hexc('#3d6a38'),
+  bark:    hexc('#6d4a36'), barkDark:  hexc('#533a2a'),
+  plaster: hexc('#f3e5cb'), beam:      hexc('#9c4a35'), beamDark: hexc('#6b3728'),
+  roof:    hexc('#2f4160'), roofLit:   hexc('#46607f'), trim: hexc('#c9964b'), gold: hexc('#e8b45a'),
+  verm:    hexc('#d34a33'), vermDark:  hexc('#9c3326'), lacquer: hexc('#2a2a31'),
+  glow:    hexc('#ffd487'),
+  pink1:   hexc('#ffd9e8'), pink2: hexc('#ffb4d2'), pink3: hexc('#f48fb1'), pink4: hexc('#e5688d'), white: hexc('#fff3f7'),
+  pine:    hexc('#2f6a4a'), pineLit: hexc('#4d8a5c'), pineDark: hexc('#20503a'),
+  maple:   hexc('#d0562f'), mapleLit: hexc('#e8863c'), mapleGold: hexc('#f2c04a'), mapleDeep: hexc('#a83a2b'),
+  ginkgo:  hexc('#f6c344'), ginkgoLit: hexc('#ffe07a'),
+  willow:  hexc('#8fbf62'), willowLit: hexc('#b9d68a'),
+  bamboo:  hexc('#5f9c4c'), bambooLit: hexc('#8ac06b'), bambooNode: hexc('#3f6b34'),
+  azalea:  hexc('#d4487c'), azaleaLit: hexc('#ef7a9d'), azaleaDeep: hexc('#a4306a'),
+  hydrangea: hexc('#5a7fd6'), hydrangeaLit: hexc('#8fb2e8'),
+  water:   hexc('#2b7a90'), waterLit: hexc('#5fb6c6'), foam: hexc('#d8f1f6'),
+  snow:    hexc('#eef3f8'), mountain: hexc('#5c7288'), mountainFar: hexc('#75899c'),
+  cloud:   hexc('#fdfaf6'), cloudShade: hexc('#dbe3ee'),
+  fur:     hexc('#c08b5e'), furDark: hexc('#8c6241'), cream: hexc('#e8d3b2'), antler: hexc('#a4885f'),
+  wood:    hexc('#8b6a4a'), woodDark: hexc('#66503a'), straw: hexc('#b99156'), strawDark: hexc('#8d6b40'),
+  tile:    hexc('#33465f'),
+  daisy:   hexc('#fff6d2'), tulip: hexc('#e8503a'), lavender: hexc('#8f6fb0'), clover: hexc('#f2a0bd'), sunflower: hexc('#f6c22e'),
+  reed:    hexc('#8a9c54'), reedLit: hexc('#b6c278'),
+  koi1:    hexc('#f2752f'), koi2: hexc('#f4e9d6'), koi3: hexc('#dd4a38'),
+  bird:    hexc('#42546e'), birdLit: hexc('#cfd8e4'),
+  fly:     hexc('#5ec9dd'),
+  haze:    hexc('#6f8a68'),
+};
+const PINKS = [P.pink1, P.pink2, P.pink3, P.pink4, P.white];
+
+/* ---------- voxel bookkeeping ---------- */
+const KIND = { PLAIN:0, WATER:1, LEAF:2, GLOW:3, PETAL:4 };
+const objs = [];
+function box(x,y,z,w,h,d,col,o={}){
+  objs.push({ x, y, z, w, h, d, col,
+    kind: o.kind ?? 0, sway: o.sway ?? 0, phase: o.phase ?? rnd()*TAU,
+    spin: o.spin ?? 0, rot: o.rot ?? 0 });
+}
+function blob(cx,cy,cz, rx,ry,rz, cols, dens=0.8, opt={}){
+  for(let dx=-rx; dx<=rx; dx++) for(let dy=-ry; dy<=ry; dy++) for(let dz=-rz; dz<=rz; dz++){
+    const e=(dx*dx)/(rx*rx+0.001)+(dy*dy)/(ry*ry+0.001)+(dz*dz)/(rz*rz+0.001);
+    if(e>1.05) continue;
+    if(rnd()>dens) continue;
+    const c = cols[(Math.floor(e*cols.length)+((rnd()*2)|0))%cols.length];
+    box(cx+dx, cy+dy, cz+dz, 1,1,1, jit(c, 0.12), opt);
+  }
+}
+function rockCluster(cx,cy,cz, n, scale=1){
+  for(let i=0;i<n;i++){
+    const s = rrange(1,2.2)*scale;
+    box(cx+rrange(-3,3)*scale, cy+rrange(-0.6,1.6)*scale, cz+rrange(-3,3)*scale,
+        s, s*0.8, s, jit(mix(P.stone,P.stoneWarm,rnd()),0.16), {rot:rnd()*TAU});
+  }
+}
+
+/* ---------- world height field ---------- */
+const POND = {x:12, z:10, rx:9, rz:7};
+function pondD(x,z){ const a=(x-POND.x)/POND.rx, b=(z-POND.z)/POND.rz; return a*a+b*b; }
+function streamX(z){ return 12 + 6*Math.sin(z*0.16) + 2.2*Math.sin(z*0.35+1.1); }
+function terrainH(x,z){
+  let h = 1.15 + fbm(x*0.055, z*0.055)*2.4 + fbm(x*0.17+7, z*0.17-3)*0.8;
+  const md = Math.hypot(x+14, z+12);
+  h += 4.3*Math.exp(-(md*md)/110);
+  const px = x+14, pz = z+12;
+  if (px > -7.5 && px < 7.5) {
+    if (pz > -7 && pz < 7) h = 4.6;
+    else if (pz >= 7 && pz < 11) h = 4.6 - (pz-7)*0.8;
+  }
+  const pd = pondD(x,z);
+  if (pd < 1.15) h -= 2.9*Math.max(0, 1-pd);
+  if (z > 12) { const dx = Math.abs(x - streamX(z)); if (dx < 3.4) h -= 1.9*(1-dx/3.4); }
+  return h;
+}
+function groundColor(x,z,h){
+  if (h < -0.45) return jit(mix(P.mud,P.sand,rnd()),0.14);
+  if (h < 0.3)   return jit(P.sand,0.12);
+  let c = fbm(x*0.22+11, z*0.22-5) > 0.6 ? P.moss : P.grass;
+  if (fbm(x*0.08, z*0.08) > 0.55) c = mix(c, P.grassLit, 0.45);
+  const md = Math.hypot(x+14, z+12);
+  if (md < 20) c = mix(c, P.gravel, 0.6 - md/20*0.6);
+  if (pondD(x,z) < 1.6) c = mix(c, P.sand, 0.5);
+  if (z > 12 && Math.abs(x-streamX(z)) < 6) c = mix(c, hexc('#8d7c5c'), 0.4);
+  return jit(c, 0.14);
+}
+
+/* ============================ SCENE ============================ */
+function buildTerrain(){
+  box(-62,-4,-62, 124, 3, 124, P.haze);                 // far ground plate (hidden by fog)
+  for(let x=-32; x<=32; x++) for(let z=-32; z<=32; z++){
+    const h = terrainH(x,z);
+    box(x, -2.4, z, 1, h+2.4, 1, groundColor(x,z,h));
+  }
+}
+function buildMountains(){
+  for(let i=0;i<30;i++){
+    const a = (i/30)*TAU + rnd()*0.1;
+    const r = 46 + rnd()*16;
+    const x = Math.cos(a)*r, z = Math.sin(a)*r;
+    const w = rrange(8,16), h = rrange(8,22);
+    box(x-w/2, -2, z-w/2, w, h+2, w, jit(mix(P.mountain,P.mountainFar,rnd()),0.12), {rot:rnd()*TAU});
+    if (h > 14) box(x-w/4, h-2.5, z-w/4, w/2, 3.5, w/2, jit(P.snow,0.06));
+  }
+  for(let i=0;i<70;i++){
+    const a = rnd()*TAU, r = 33 + rnd()*9;
+    const x = Math.cos(a)*r, z = Math.sin(a)*r;
+    blob(x, terrainH(x,z)+rrange(1.5,3.2), z, 2, 2, 2,
+      [P.pineDark, P.pine, P.pineLit], 0.85, {sway:0.06});
+  }
+}
+function roof(cx,cz,ry,half,roofCol,trimCol){
+  for(let dx=-half; dx<=half; dx++) for(let dz=-half; dz<=half; dz++){
+    const r = Math.max(Math.abs(dx), Math.abs(dz));
+    let lvl = ry - Math.round(r*0.62);
+    const corner = Math.abs(dx)===half && Math.abs(dz)===half;
+    if (corner) lvl = ry - Math.round(half*0.62) + 1;
+    let c = jit(roofCol, 0.14);
+    if (r===half) c = mix(c, trimCol, 0.42);
+    if (corner) c = trimCol;
+    box(cx+dx, lvl, cz+dz, 1,1,1, c);
+    if (r===half) box(cx+dx, lvl-1, cz+dz, 1,0.9,1, jit(P.roofDark||P.roof,0.1));
+  }
+  for (const sx of [-1,1]) for (const sz of [-1,1]) {
+    box(cx+sx*half, ry-Math.round(half*0.62)+0.2, cz+sz*half, 0.55, 1.05, 0.55, P.gold,
+      {kind:KIND.LEAF, sway:0.14, phase:rnd()*TAU});   // hanging chime bells on the curled eaves
+  }
+}
+function buildPagoda(cx,cz,baseY){
+  box(cx-6, baseY, cz-6, 13, 2, 13, jit(P.stone,0.08));
+  for(let i=-6;i<=6;i++){
+    box(cx+i, baseY+1.9, cz-7, 1, 0.9, 1, jit(P.stoneDark,0.12));
+    box(cx+i, baseY+1.9, cz+7, 1, 0.9, 1, jit(P.stoneDark,0.12));
+    box(cx-7, baseY+1.9, cz+i, 1, 0.9, 1, jit(P.stoneDark,0.12));
+    box(cx+7, baseY+1.9, cz+i, 1, 0.9, 1, jit(P.stoneDark,0.12));
+  }
+  // railing
+  for(let i=-6;i<=6;i+=2){
+    for(const [rx,rz] of [[i,-6.4],[i,6.4],[-6.4,i],[6.4,i]]) box(cx+rx, baseY+2, cz+rz, 0.45,1.5,0.45, jit(P.beam,0.1));
+  }
+  for(const [sx,sz,len] of [[-6.4,0,13],[6.4,0,13],[0,-6.4,13],[0,6.4,13]]){
+    if (sx===0) box(cx-6.4+sx, baseY+3.25, cz+sz, len, 0.32, 0.42, jit(P.plaster,0.08));
+    else box(cx+sx, baseY+3.25, cz-6.4+sz, 0.42, 0.32, len, jit(P.plaster,0.08));
+  }
+  // approach steps
+  for(let k=0;k<3;k++) box(cx-2.5, baseY+1-k, cz+8+k, 6, 1, 1, jit(P.stoneWarm,0.1));
+  box(cx-4.5, baseY+0.6, cz+9.5, 2, 1.4, 3, jit(P.gravel,0.1));
+  box(cx+3.5, baseY+0.6, cz+9.5, 2, 1.4, 3, jit(P.gravel,0.1));
+  // corner lantern posts on the platform
+  for(const sx of [-1,1]) for(const sz of [-1,1]) {
+    box(cx+sx*5, baseY+2, cz+sz*5, 0.6, 2.2, 0.6, P.beamDark);
+    box(cx+sx*5-0.45, baseY+4.2, cz+sz*5-0.45, 1.4, 1.2, 1.4, P.glow, {kind:KIND.GLOW});
+    box(cx+sx*5-0.55, baseY+5.4, cz+sz*5-0.55, 1.6, 0.4, 1.6, P.roof);
+  }
+  let y = baseY + 2;
+  const tiers = [[9,7,4],[8,6,4],[6,5,4],[5,4,3],[4,3,3]];
+  tiers.forEach(([w, half, hh], t)=>{
+    const a = cx-(w-1)/2, b = cz-(w-1)/2;
+    box(a, y, b, w, hh, 1, jit(P.plaster,0.06));
+    box(a, y, b+w-1, w, hh, 1, jit(P.plaster,0.06));
+    box(a, y, b, 1, hh, w, jit(P.plaster,0.06));
+    box(a+w-1, y, b, 1, hh, w, jit(P.plaster,0.06));
+    for(const sx of [-1,1]) for(const sz of [-1,1])
+      box(cx+sx*(w-1)/2-0.1, y, cz+sz*(w-1)/2-0.1, 1.2, hh, 1.2, jit(P.beam,0.12));
+    box(a-0.05, y+hh-0.4, b-0.05, w+0.1, 0.4, 1.1, jit(P.beam,0.1));
+    box(a-0.05, y+hh-0.4, b+w-1-0.05, w+0.1, 0.4, 1.1, jit(P.beam,0.1));
+    box(a-0.05, y+hh-0.4, b-0.05, 1.1, 0.4, w+0.1, jit(P.beam,0.1));
+    box(a+w-1-0.05, y+hh-0.4, b-0.05, 1.1, 0.4, w+0.1, jit(P.beam,0.1));
+    if (t===0){
+      box(cx-1.5, y+0.1, cz+(w-1)/2+0.1, 3, 2.4, 1.1, jit(P.beamDark,0.1));
+      box(cx-0.8, y+0.9, cz+(w-1)/2+0.55, 1.6, 1.5, 0.4, P.glow, {kind:KIND.GLOW});
+      box(cx-4, y+1.4, cz+(w-1)/2+0.1, 1.2, 1.5, 0.6, jit(P.plaster,0.05));
+      box(cx+3, y+1.4, cz+(w-1)/2+0.1, 1.2, 1.5, 0.6, jit(P.plaster,0.05));
+    } else {
+      for(const sx of [-1,1]) box(cx+sx*(w/2-1)-0.3, y+1.2, cz+(w-1)/2+0.1, 1.1, 1.2, 0.8, hexc('#3b2b23'));
+    }
+    const ry = y + hh;
+    roof(cx, cz, ry, half, t%2 ? P.roof : P.roofLit, P.trim);
+    y = ry + 1;
+  });
+  // spire
+  box(cx-0.6, y, cz-0.6, 2, 8, 2, jit(P.gold,0.08));
+  for(let k=0;k<4;k++) box(cx-1.6, y+1.3+k*1.7, cz-1.6, 3.2, 0.5, 3.2, jit(P.trim,0.08));
+  box(cx-0.7, y+8, cz-0.7, 2.2, 2, 2.2, jit(P.gold,0.06));
+  box(cx-0.4, y+9.8, cz-0.4, 1.4, 1.5, 1.4, P.glow, {kind:KIND.GLOW});
+  box(cx-0.25, y+11.2, cz-0.25, 1.1, 1.1, 1.1, hexc('#ffe9b0'), {kind:KIND.GLOW});
+}
+function buildStoneLantern(x,z,y,s=1){
+  const st = jit(P.stone,0.1);
+  box(x-1*s, y, z-1*s, 2*s, 0.9, 2*s, st);
+  box(x-0.45*s, y+0.9, z-0.45*s, 0.9*s, 1.7, 0.9*s, jit(P.stoneWarm,0.1));
+  box(x-1.1*s, y+2.6, z-1.1*s, 2.2*s, 1.7, 2.2*s, st);
+  for(const [dx,dz] of [[0,-1.15*s],[0,1.15*s],[-1.15*s,0],[1.15*s,0]])
+    box(x+dx-0.35*s, y+2.9, z+dz-0.35*s, 0.75*s, 1.1, 0.55*s, P.glow, {kind:KIND.GLOW});
+  box(x-1.5*s, y+4.3, z-1.5*s, 3*s, 0.8, 3*s, jit(P.stoneDark,0.1));
+  box(x-0.35*s, y+5.1, z-0.35*s, 0.7*s, 0.8, 0.7*s, jit(P.stone,0.1));
+}
+function buildTorii(x,z,y){
+  box(x-3.2, y, z-0.7, 1.4, 6.6, 1.4, jit(P.verm,0.1));
+  box(x+2,  y, z-0.7, 1.4, 6.6, 1.4, jit(P.verm,0.1));
+  for(const sx of [-3.2,2]) { box(x+sx-0.2, y-0.6, z-1.1, 1.8, 1.2, 2.2, jit(P.stoneDark,0.1)); }
+  for(let dx=-4; dx<=4; dx++){
+    const end = Math.abs(dx)===4 ? 1 : (Math.abs(dx)===3 ? 0.5 : 0);
+    box(x+dx, y+6.3+end, z-0.5, 1, 0.9, 1.1, jit(P.lacquer,0.08));
+    box(x+dx, y+5.4+end*0.6, z-0.6, 1, 0.8, 1.3, jit(P.verm,0.1));
+  }
+  box(x-4, y+7.2, z-0.5, 9, 0.55, 1.2, jit(P.lacquer,0.06));
+  box(x-3.4, y+4.2, z-0.45, 6.8, 0.8, 1.2, jit(P.vermDark,0.1));
+  box(x-1.2, y+4.9, z-0.85, 2.4, 1.3, 0.5, jit(P.plaster,0.05));
+  box(x-0.4, y+5.2, z-1.05, 0.8, 0.5, 0.4, P.beamDark);
+}
+function buildBridge(cx,cz){
+  for(let dx=-8; dx<=8; dx++){
+    const lvl = 2.2 + 2.6*(1-(dx*dx/64));
+    box(cx+dx, lvl, cz-1.5, 1, 0.7, 3, jit(P.verm,0.12));
+    if (dx%2===0) {
+      box(cx+dx-0.2, lvl+0.7, cz-1.9, 0.45, 1.2, 0.45, jit(P.plaster,0.06));
+      box(cx+dx-0.2, lvl+0.7, cz+1.5, 0.45, 1.2, 0.45, jit(P.plaster,0.06));
+    }
+    box(cx+dx-0.5, lvl+1.8, cz-1.75, 1.1, 0.35, 0.5, jit(P.vermDark,0.1));
+    box(cx+dx-0.5, lvl+1.8, cz+1.3, 1.1, 0.35, 0.5, jit(P.vermDark,0.1));
+    if (lvl > 3.6) box(cx+dx, lvl-2.4, cz-1, 1.2, 2.4, 2, jit(P.stoneDark,0.1));
+  }
+  for(const sx of [-8,8]) { box(cx+sx, 2.0, cz, 0.7, 3.4, 0.7, P.beamDark);
+    box(cx+sx-0.5, 5.4, cz-0.5, 1.4, 1.1, 1.4, P.glow, {kind:KIND.GLOW});
+    box(cx+sx-0.6, 6.5, cz-0.6, 1.6, 0.4, 1.6, P.roof); }
+}
+function buildPavilion(cx,cz,y){
+  box(cx-2.5, y, cz-2.5, 5, 1.1, 5, jit(P.wood,0.1));
+  for(const sx of [-1,1]) for(const sz of [-1,1]) box(cx+sx*2-0.3, y+1.1, cz+sz*2-0.3, 0.7, 3.2, 0.7, jit(P.woodDark,0.1));
+  box(cx-2.5, y+1.1, cz+2.4, 5, 0.8, 0.5, jit(P.woodDark,0.08));
+  roof(cx, cz, y+4.6, 3, P.straw, P.strawDark);
+  box(cx-1, y+1.2, cz-1, 2, 0.5, 2, jit(P.woodDark,0.1));
+  for(const [dx,dz] of [[-0.6,-0.6],[0.5,-0.2],[-0.2,0.6]])
+    box(cx+dx, y+1.7, cz+dz, 0.5, 0.45, 0.5, hexc('#e3e9ec'));
+  box(cx+0.9, y+1.7, cz+0.9, 0.4, 0.5, 0.4, hexc('#b03f3a'));
+  box(cx-0.4, y+3.3, cz-0.4, 1.3, 1.3, 1.3, P.glow, {kind:KIND.GLOW});
+  box(cx-2.5, y+1.1, cz-2.5, 5, 0.4, 0.4, jit(P.woodDark,0.08));
+}
+function buildPond(){
+  const y = 0.55;
+  for(let x=POND.x-10; x<=POND.x+10; x++) for(let z=POND.z-8; z<=POND.z+8; z++){
+    const pd = pondD(x,z);
+    if (pd > 1.02) continue;
+    const c = mix(P.water, P.waterLit, clamp(1-pd,0,1)*0.55 + rnd()*0.15);
+    box(x, y, z, 1, 0.62, 1, c, {kind:KIND.WATER, phase:x*0.55+z*0.7});
+  }
+  for(let i=0;i<44;i++){
+    const a=rnd()*TAU, x=POND.x+Math.cos(a)*(POND.rx+rrange(-0.6,1.6)), z=POND.z+Math.sin(a)*(POND.rz+rrange(-0.6,1.6));
+    const s=rrange(1,2);
+    box(Math.round(x)-s/2, terrainH(x,z)-0.4, Math.round(z)-s/2, s, s*0.9, s, jit(mix(P.stone,P.stoneWarm,rnd()),0.18), {rot:rnd()*TAU});
+  }
+  for(let i=0;i<14;i++){
+    const a=rnd()*TAU, x=Math.round(POND.x+Math.cos(a)*rrange(2,POND.rx-2)), z=Math.round(POND.z+Math.sin(a)*rrange(2,POND.rz-2));
+    box(x-0.6, 0.72, z-0.6, 1.3, 0.22, 1.3, jit(hexc('#4c7f52'),0.12));
+    if (rnd()<0.35) { box(x-0.3, 0.92, z-0.3, 0.7, 0.5, 0.7, jit(mix(P.pink2,P.white,rnd()),0.1), {kind:KIND.LEAF, sway:0.08}); }
+  }
+  for(let i=0;i<38;i++){
+    const a=rnd()*TAU, x=Math.round(POND.x+Math.cos(a)*(POND.rx+rrange(0.2,2.4))), z=Math.round(POND.z+Math.sin(a)*(POND.rz+rrange(0.2,2.4)));
+    const hgt=rrange(2,4.5);
+    box(x-0.2, terrainH(x,z), z-0.2, 0.42, hgt, 0.42, jit(rnd()<0.5?P.reed:P.reedLit,0.14), {kind:KIND.LEAF, sway:0.34});
+  }
+  blob(POND.x-4, 0.75, POND.z+4, 2, 0.4, 2, [P.foam, P.waterLit], 0.55, {kind:KIND.WATER});
+}
+function buildStream(){
+  for(let z=13; z<=36; z++){
+    const cx = streamX(z);
+    for(let dx=-3; dx<=3; dx++){
+      const w = 3.4 - Math.abs(dx);
+      if (w <= 0) continue;
+      box(Math.round(cx+dx), 0.42, z, 1, 0.55, 1, mix(P.water, P.waterLit, 0.35+rnd()*0.2), {kind:KIND.WATER, phase:z*0.8+dx*0.4});
+    }
+    for(const s of [-1,1]) {
+      if (rnd()<0.3) { const x=Math.round(cx+s*rrange(3.5,5.5));
+        box(x-0.5, terrainH(x,z)-0.3, z-0.5, 1.2, 1.1, 1.2, jit(mix(P.stone,P.stoneWarm,rnd()),0.2), {rot:rnd()*TAU}); }
+    }
+  }
+}
+function buildWaterfall(){
+  const cx = 9, cz = 2;
+  for(let x=4; x<=14; x++) for(let z=-1; z<=3; z++){
+    const hh = 6.5 - Math.abs(x-cx)*0.35 - Math.abs(z-cz)*0.5 + fbm(x*0.5,z*0.5)*1.6;
+    const c = fbm(x*0.3+3, z*0.3) > 0.55 ? mix(P.moss, P.stoneDark, 0.45) : mix(P.stone, P.stoneWarm, rnd());
+    box(x, -1, z, 1, Math.max(1,hh)+1, 1, jit(c,0.12));
+  }
+  for(let x=6; x<=12; x++) for(let z=0; z<=2; z++)
+    box(x, 6.6, z, 1, 0.6, 1, mix(P.waterLit, P.foam, 0.35), {kind:KIND.WATER, phase:x*0.6+z*0.5});
+  rockCluster(cx-5, 2.4, cz+3, 8, 1.1);
+  rockCluster(cx+6, 2.2, cz+2, 7, 1.0);
+}
+function buildRocks(){
+  rockCluster(-26, terrainH(-26,12), 12, 9, 1.2);
+  rockCluster(26, terrainH(26,22), 22, 7, 1.1);
+  rockCluster(-30, terrainH(-30,-22), -22, 8, 1.3);
+  rockCluster(2, terrainH(2,-22), -22, 6, 1.0);
+  rockCluster(-6, terrainH(-6,26), 26, 6, 1.0);
+  for(let i=0;i<14;i++){
+    const x=Math.round(rrange(-30,30)), z=Math.round(rrange(-30,30));
+    if (pondD(x,z)<1.7 || Math.abs(x+14)<12 && Math.abs(z+12)<12) continue;
+    const s=rrange(1,2.4);
+    box(x-s/2, terrainH(x,z)-0.5, z-s/2, s, s*0.8, s, jit(mix(P.stone,P.stoneWarm,rnd()),0.18), {rot:rnd()*TAU});
+  }
+}
+/* ---------- trees ---------- */
+const blossomTrees = [];
+function trunk(x,y,z, h, w=1){
+  for(let k=0;k<h;k++) box(x-w/2, y+k, z-w/2, w, 1, w, jit(rnd()<0.35?P.barkDark:P.bark,0.12));
+}
+function branch(x,y,z, dx,dy,dz, len, col){
+  let cx=x, cy=y, cz=z;
+  for(let k=0;k<len;k++){
+    cx += dx; cy += dy; cz += dz;
+    box(Math.round(cx)-0.35, Math.round(cy)-0.35, Math.round(cz)-0.35, 0.7,0.7,0.7, jit(col,0.12));
+  }
+}
+function cherryTree(x,z,s=1){
+  const y = terrainH(x,z);
+  const th = Math.round(7*s);
+  trunk(x, y, z, th, 1.3);
+  for(let i=0;i<5;i++){
+    const a = rnd()*TAU;
+    branch(x, y+th-rrange(1,4), z, Math.cos(a)*0.6, 0.5, Math.sin(a)*0.6, Math.round(rrange(3,6)*s), P.bark);
+  }
+  const top = y+th+1.5, rx = 5.2*s, ry = 3.2*s, rz = 5.2*s;
+  for(let i=0;i<Math.round(26*s+8); i++){
+    const a=rnd()*TAU, b=Math.acos(rnd()*0.85+0.15), r=rrange(0.3,1)*Math.max(rx,rz);
+    const px = x+Math.cos(a)*Math.sin(b)*r, py = top+Math.cos(b)*ry*rrange(0.3,1)-0.6, pz = z+Math.sin(a)*Math.sin(b)*r;
+    const cols = rnd()<0.18 ? [P.white,P.pink1] : PINKS;
+    blob(Math.round(px), Math.round(py), Math.round(pz), 2, 1.5, 2, cols, 0.75,
+      {kind:KIND.LEAF, sway:rrange(0.16,0.32)});
+  }
+  blob(x, top+1, z, 2.4*s, 1.6*s, 2.4*s, PINKS, 0.5, {kind:KIND.LEAF, sway:0.26});
+  blossomTrees.push({x, y:top+1.5, z, s});
+}
+function pineTree(x,z,h=12){
+  const y = terrainH(x,z);
+  trunk(x, y, z, Math.round(h*0.55), 1.2);
+  const layers = 5;
+  for(let l=0;l<layers;l++){
+    const t = l/(layers-1);
+    const r = (1-t)*4.2 + 1;
+    const yy = y + h*0.45 + t*h*0.62;
+    for(let dx=-Math.ceil(r); dx<=Math.ceil(r); dx++) for(let dz=-Math.ceil(r); dz<=Math.ceil(r); dz++){
+      const d = Math.hypot(dx,dz);
+      if (d > r) continue;
+      const c = mix(P.pineDark, P.pineLit, clamp(d/r,0,1)*0.7 + rnd()*0.25);
+      box(Math.round(x+dx), Math.round(yy - d*0.35), Math.round(z+dz), 1, 1.3, 1, jit(c,0.12), {kind:KIND.LEAF, sway:0.1});
+    }
+  }
+}
+function mapleTree(x,z,s=1,cols=[P.maple,P.mapleLit,P.mapleDeep,P.mapleGold]){
+  const y = terrainH(x,z);
+  trunk(x, y, z, Math.round(6*s), 1.2);
+  for(let i=0;i<4;i++){ const a=rnd()*TAU;
+    branch(x, y+5*s, z, Math.cos(a)*0.55, 0.45, Math.sin(a)*0.55, 4, P.barkDark); }
+  for(let i=0;i<9;i++){
+    const a=rnd()*TAU, r=rrange(1.5,4.2)*s;
+    blob(Math.round(x+Math.cos(a)*r), y+6.5*s+rrange(0,3)*s, Math.round(z+Math.sin(a)*r),
+      2, 1.6, 2, cols, 0.72, {kind:KIND.LEAF, sway:0.3});
+  }
+}
+function ginkgoTree(x,z,s=1){
+  const y = terrainH(x,z);
+  trunk(x, y, z, Math.round(8*s), 1.1);
+  for(let l=0;l<3;l++){
+    const r = (3-l)*2.2*s + 1.5;
+    const yy = y + 6*s + l*2.2;
+    blob(x, yy, z, r, 1.2, r, [P.ginkgo,P.ginkgoLit], 0.6, {kind:KIND.LEAF, sway:0.28});
+  }
+  for(let i=0;i<22;i++){ const a=rnd()*TAU, r=rrange(1,5);
+    box(Math.round(x+Math.cos(a)*r), terrainH(x,z)+0.35, Math.round(z+Math.sin(a)*r), 0.6,0.25,0.6, jit(P.ginkgo,0.15), {rot:rnd()*TAU}); }
+}
+function willowTree(x,z){
+  const y = terrainH(x,z);
+  trunk(x, y, z, 7, 1.5);
+  blob(x, y+8.5, z, 4, 2, 4, [P.willow,P.willowLit], 0.55, {kind:KIND.LEAF, sway:0.3});
+  for(let i=0;i<26;i++){
+    const a=rnd()*TAU, r=rrange(2,5.2);
+    const px=Math.round(x+Math.cos(a)*r), pz=Math.round(z+Math.sin(a)*r), py=y+8+rrange(0,2);
+    const len=Math.round(rrange(4,8));
+    for(let k=0;k<len;k++) box(px, py-k, pz, 0.5, 1.1, 0.5, jit(rnd()<0.4?P.willowLit:P.willow,0.14), {kind:KIND.LEAF, sway:rrange(0.2,0.42)});
+  }
+}
+function bambooGrove(x,z,n=9){
+  for(let i=0;i<n;i++){
+    const px=Math.round(x+rrange(-4,4)), pz=Math.round(z+rrange(-4,4)), hgt=Math.round(rrange(8,13));
+    const y=terrainH(px,pz);
+    for(let k=0;k<hgt;k++)
+      box(px-0.28, y+k, pz-0.28, 0.56, 1, 0.56, jit(k%3===0?P.bambooNode:P.bamboo,0.14), {kind:KIND.LEAF, sway:0.22});
+    for(let k=0;k<4;k++){
+      const a=rnd()*TAU;
+      box(px+Math.cos(a)*1.4, y+hgt-rrange(0,3), pz+Math.sin(a)*1.4, 1,0.5,1, jit(P.bambooLit,0.16), {kind:KIND.LEAF, sway:0.4});
+    }
+  }
+}
+function bush(x,z,r,cols,dens=0.75){
+  const y=terrainH(x,z);
+  blob(Math.round(x), y+1.2, Math.round(z), r, r*0.75, r, cols, dens, {kind:KIND.LEAF, sway:0.18});
+  blob(Math.round(x), y+0.6, Math.round(z), r*0.9, 0.5, r*0.9, [P.moss,P.grass], 0.7);
+}
+function hedge(x,z,len,along){
+  for(let i=0;i<len;i++){
+    const px = along==='x' ? x+i : x, pz = along==='z' ? z+i : z;
+    const y = terrainH(px,pz);
+    box(px-0.5, y+0.2, pz-0.5, 1, 1.6, 1, jit(mix(P.moss,P.pineLit,rnd()),0.14), {kind:KIND.LEAF, sway:0.12});
+  }
+}
+function buildTrees(){
+  cherryTree(-25, 4, 1.25); cherryTree(-19, 18, 1.1); cherryTree(-28, -6, 0.95);
+  cherryTree(3, 25, 1.0); cherryTree(21, 20, 0.8);
+  pineTree(27,-18,13); pineTree(31,-9,10); pineTree(22,-26,14); pineTree(-4,-28,11); pineTree(33,12,9);
+  mapleTree(-8,-22,1.1); mapleTree(-22,22,0.95,[P.mapleGold,P.mapleLit,P.maple]); mapleTree(6,-8,0.8);
+  ginkgoTree(8,29,1); ginkgoTree(-3,-18,0.9);
+  willowTree(23,4);
+  bambooGrove(-31,-16,9); bambooGrove(-34,-8,6);
+  bush(-9,-3,2,[P.azalea,P.azaleaLit,P.azaleaDeep]);
+  bush(-5,2,1.6,[P.azaleaLit,P.azalea,P.clover]);
+  bush(4,-6,1.8,[P.azaleaDeep,P.azalea,P.azaleaLit]);
+  bush(-2,15,1.5,[P.hydrangea,P.hydrangeaLit,P.pink1]);
+  bush(5,17,1.4,[P.hydrangeaLit,P.hydrangea]);
+  bush(-17,-21,2,[P.azalea,P.azaleaDeep,P.azaleaLit]);
+  bush(16,-14,1.6,[P.clover,P.azaleaLit,P.hydrangeaLit]);
+  hedge(-20,-26,12,'x'); hedge(-34,-20,9,'z'); hedge(14,-30,10,'x');
+  bush(18,28,1.4,[P.sunflower,P.mapleGold,P.azaleaLit]);
+  bush(-12,28,1.6,[P.lavender,P.hydrangeaLit,P.clover]);
+}
+function buildGrassAndFlowers(){
+  const flowers = [P.daisy, P.tulip, P.lavender, P.clover, P.sunflower, P.pink2];
+  for(let i=0;i<420;i++){
+    const x=Math.round(rrange(-32,32)), z=Math.round(rrange(-32,32));
+    const h=terrainH(x,z);
+    if (h < 0.7 || pondD(x,z)<1.3) continue;
+    if (Math.abs(x+14)<11 && Math.abs(z+12)<11) continue;
+    box(x-0.2, h, z-0.2, 0.45, rrange(0.6,1.3), 0.45, jit(mix(P.grass,P.grassLit,rnd()),0.18),
+      {kind:KIND.LEAF, sway:rrange(0.24,0.42), rot:rnd()*TAU});
+    if (rnd()<0.42) {
+      const c = flowers[(rnd()*flowers.length)|0];
+      box(x-0.25, h+rrange(0.7,1.4), z-0.25, 0.55, 0.5, 0.55, jit(c,0.14), {kind:KIND.LEAF, sway:0.3});
+    }
+  }
+  for(let i=0;i<70;i++){
+    const t = blossomTrees[(rnd()*blossomTrees.length)|0];
+    const x=Math.round(t.x+rrange(-6,6)), z=Math.round(t.z+rrange(-6,6));
+    const h=terrainH(x,z); if (h<0.4) continue;
+    box(x-0.3, h+0.1, z-0.3, 0.6, 0.22, 0.6, jit(PINKS[(rnd()*PINKS.length)|0],0.14), {kind:KIND.LEAF, sway:0.08, rot:rnd()*TAU});
+  }
+}
+function bez(p0,p1,p2,p3,t){
+  const u=1-t, a=u*u*u, b=3*u*u*t, c=3*u*t*t, d=t*t*t;
+  return [p0[0]*a+p1[0]*b+p2[0]*c+p3[0]*d, p0[1]*a+p1[1]*b+p2[1]*c+p3[1]*d];
+}
+function buildPath(){
+  const p0=[12,33], p1=[18,22], p2=[2,10], p3=[-14,-4];
+  for(let t=0;t<=1;t+=0.035){
+    const [x,z]=bez(p0,p1,p2,p3,t);
+    const h=terrainH(x,z);
+    if (pondD(x,z)<1.05 || Math.abs(x-streamX(z))<4 && z>12) continue;
+    box(Math.round(x)-0.7, h-0.25, Math.round(z)-0.7, 1.5, 0.55, 1.5, jit(mix(P.stoneWarm,P.gravel,rnd()),0.16), {rot:rnd()*TAU});
+  }
+  // side path to the pavilion
+  for(let t=0;t<=1;t+=0.12){
+    const x = 4 - t*5, z = 14 + t*3;
+    const h=terrainH(x,z);
+    box(Math.round(x)-0.6, h-0.2, Math.round(z)-0.6, 1.3, 0.5, 1.3, jit(P.stoneWarm,0.14), {rot:rnd()*TAU});
+  }
+}
+function buildWallFence(){
+  for(let x=-34; x<=16; x++){
+    const z=-34, h=terrainH(x,z);
+    box(x-0.5, h-0.6, z-0.5, 1, 3.2, 1, jit(mix(P.stone,P.stoneWarm,rnd()),0.14));
+    box(x-0.6, h+2.6, z-0.75, 1.2, 0.7, 1.5, jit(P.tile,0.1));
+  }
+  for(let x=-34; x<=16; x+=8){
+    const z=-34, h=terrainH(x,z);
+    box(x-0.8, h-0.6, z-0.8, 1.6, 4.4, 1.6, jit(P.stoneDark,0.1));
+    box(x-1, h+3.8, z-1, 2, 0.6, 2, jit(P.tile,0.08));
+    box(x-0.35, h+4.4, z-0.35, 0.7, 0.7, 0.7, P.gold);
+  }
+  for(let x=18; x<=34; x++){
+    const z=-34, h=terrainH(x,z);
+    if (x%3===0) { box(x-0.35, h-0.4, z-0.35, 0.7, 3, 0.7, jit(P.woodDark,0.12)); }
+    else { box(x-1, h+1.1, z-0.25, 2, 0.8, 0.5, jit(P.wood,0.12)); box(x-1, h+0.3, z-0.25, 2, 0.8, 0.5, jit(P.wood,0.12)); }
+  }
+  const gx=22, gz=-34, gh=terrainH(gx,gz);
+  box(gx-1.3, gh-0.5, gz-0.9, 1.6, 5, 1.8, jit(P.stoneDark,0.1));
+  box(gx+1.5, gh-0.5, gz-0.9, 1.6, 5, 1.8, jit(P.stoneDark,0.1));
+  box(gx-2.2, gh+4.5, gz-1.1, 5.4, 0.7, 2.2, jit(P.tile,0.1));
+  box(gx-1.5, gh+1.2, gz-0.4, 3, 2.4, 0.8, jit(P.woodDark,0.1));
+  for(const sx of [-1.3,1.5]) box(gx+sx-0.3, gh+5.2, gz-0.3, 0.7, 1.1, 0.7, P.glow, {kind:KIND.GLOW});
+}
+function buildDetails(){
+  buildTorii(12, 33, terrainH(12,33));
+  buildBridge(10, 24);
+  buildPavilion(0, 17, terrainH(0,17));
+  // stone lanterns along the path
+  for(const [x,z] of [[17,27],[6,18],[-4,12],[-11,4],[4,27],[-20,-2],[3,32]]) {
+    buildStoneLantern(x, z, terrainH(x,z), 0.9);
+  }
+  // tsukubai water basin near the pavilion
+  const bx=-5, bz=21, by=terrainH(bx,bz);
+  box(bx-1.1, by, bz-1.1, 2.2, 1.4, 2.2, jit(P.stoneDark,0.1));
+  box(bx-0.6, by+1.4, bz-0.6, 1.2, 0.4, 1.2, P.waterLit, {kind:KIND.WATER});
+  box(bx+0.6, by+1.8, bz-0.2, 0.35, 2.4, 0.35, jit(P.bamboo,0.12), {kind:KIND.LEAF, sway:0.1});
+  box(bx+0.2, by+4.1, bz-0.2, 1.1, 0.4, 0.4, jit(P.bambooLit,0.12));
+  // deer on a rock by the pond shore
+  deer(2, 12, terrainH(2,12));
+  // paper lanterns strung from the pavilion to a cherry tree
+  ropeLanterns(1, 17, terrainH(0,17)+5.6, 4, 24, terrainH(3,25)+8);
+}
+function deer(x,z,y){
+  rockCluster(x, y-0.4, z, 4, 0.9);
+  const base = y + 1.6;
+  box(x-2, base+2.2, z-0.8, 4, 1.8, 1.6, jit(P.fur,0.08));
+  box(x+1.5, base+2.4, z-0.7, 1.4, 2.1, 1.4, jit(P.fur,0.06));
+  box(x-2.2, base+2.1, z-0.7, 1.1, 1.7, 1.4, jit(P.furDark,0.08));
+  box(x+2.2, base+4.2, z-0.4, 1.0, 1.6, 0.85, jit(P.fur,0.07));
+  box(x+2.9, base+5.2, z-0.35, 1.5, 1.0, 0.8, jit(P.cream,0.06));
+  box(x+3.9, base+5.5, z-0.25, 0.6, 0.45, 0.5, hexc('#3b2f26'));
+  for(const sz of [-1,1]) box(x+2.6, base+5.6, z+sz*0.85-0.2, 0.45, 0.85, 0.4, jit(P.furDark,0.1));
+  for(const sz of [-1,1]) { box(x+2.5, base+6.4, z+sz*0.4-0.2, 0.3, 1.3, 0.3, jit(P.antler,0.1));
+    box(x+2.7, base+6.9, z+sz*0.7-0.2, 0.3, 0.3, 0.3, jit(P.antler,0.1)); }
+  for(const [lx,lz] of [[x+2,z-0.6],[x+2,z+0.45],[x-1.7,z-0.6],[x-1.7,z+0.45]])
+    box(lx-0.25, base, lz-0.25, 0.55, 2.3, 0.55, jit(P.furDark,0.1));
+  box(x-2.5, base+3.5, z-0.2, 0.55, 0.7, 0.55, jit(P.cream,0.08));
+  for(let i=0;i<5;i++) box(x-1.5+i*0.7, base+3.4, z+0.7, 0.35, 0.35, 0.35, jit(P.cream,0.1));
+}
+function ropeLanterns(ax,az,ay,bx,bz,by){
+  const n=8;
+  for(let i=0;i<=n;i++){
+    const t=i/n, x=ax+(bx-ax)*t, z=az+(bz-az)*t;
+    const sag = Math.sin(t*Math.PI)*1.2;
+    box(x-0.18, ay+(by-ay)*t-sag, z-0.18, 0.36, 0.36, 0.36, hexc('#5d4a3a'));
+    if (i===2||i===4||i===6) {
+      const ly = ay+(by-ay)*t-sag-1.3;
+      box(x-0.5, ly, z-0.5, 1, 1.4, 1, jit(P.glow,0.06), {kind:KIND.GLOW, sway:0.12});
+      box(x-0.6, ly+1.4, z-0.6, 1.2, 0.35, 1.2, hexc('#8b3a2e'), {sway:0.12});
+      box(x-0.15, ly-0.5, z-0.15, 0.3, 0.5, 0.3, hexc('#b03f2f'), {sway:0.12});
+    }
+  }
+}
+
+/* ---------- dynamic bits ---------- */
+let petals=[], clouds=[], birds=[], butts=[], flies=[], koi=[], falls=[];
+function makeDynamic(){
+  for(let i=0;i<230;i++){
+    const t = blossomTrees[(rnd()*blossomTrees.length)|0];
+    petals.push({ x:t.x+rrange(-7,7), y:t.y+rrange(-2,6), z:t.z+rrange(-7,7),
+      col:jit(PINKS[(rnd()*PINKS.length)|0],0.12), ph:rnd()*TAU, s:rrange(0.35,0.6), fall:rrange(0.02,0.05), spin:rrange(1.1,2.4), tree:t });
+  }
+  for(let c=0;c<4;c++){
+    const cx=rrange(-55,55), cy=rrange(26,38), cz=rrange(-55,55), parts=[];
+    for(let i=0;i<13;i++) parts.push({ dx:rrange(-7,7), dy:rrange(-1.6,2.2), dz:rrange(-5,5),
+      w:rrange(3,7), h:rrange(1.2,2.6), d:rrange(3,6), col:jit(rnd()<0.6?P.cloud:P.cloudShade,0.06) });
+    clouds.push({cx,cy,cz,vx:rrange(0.25,0.6),parts});
+  }
+  for(let i=0;i<6;i++) birds.push({ a:rnd()*TAU, r:rrange(13,20), y:rrange(19,27), sp:rrange(0.16,0.3), ph:rnd()*TAU, s:rrange(0.8,1.3) });
+  for(let i=0;i<9;i++){ const t=blossomTrees[(rnd()*blossomTrees.length)|0];
+    butts.push({ cx:t.x, cy:t.y-1, cz:t.z, ph:rnd()*TAU, col:jit(rnd()<0.5?P.pink2:P.sunflower,0.15), r:rrange(3,7) }); }
+  for(let i=0;i<5;i++) flies.push({ cx:POND.x+rrange(-6,6), cz:POND.z+rrange(-5,5), ph:rnd()*TAU, r:rrange(3,8) });
+  for(let i=0;i<4;i++) koi.push({ a:rnd()*TAU, r:rrange(2.5,POND.rx-2.5), sp:rrange(0.16,0.34)*(rnd()<0.5?1:-1),
+    col:jit([P.koi1,P.koi2,P.koi3][(rnd()*3)|0],0.1), ph:rnd()*TAU });
+  for(let i=0;i<46;i++) falls.push({ t:rnd(), x:9+rrange(-3.5,3.5), z:2+rrange(-1.5,2.5), sp:rrange(0.35,0.7), s:rrange(0.4,0.8) });
+}
+function writeDyn(a, i, cx,cy,cz, sx,sy,sz, col, rot=0, spin=0, kind=0, sway=0, phase=0){
+  const b=i*24;
+  a[b]=cx; a[b+1]=cy; a[b+2]=cz; a[b+3]=sx; a[b+4]=sy; a[b+5]=sz;
+  a[b+6]=col[0]; a[b+7]=col[1]; a[b+8]=col[2];
+  a[b+9]=1; a[b+10]=1; a[b+11]=1; a[b+12]=1; a[b+13]=1; a[b+14]=1; a[b+15]=1; a[b+16]=1;
+  a[b+17]=1; a[b+18]=sway; a[b+19]=phase; a[b+20]=spin; a[b+21]=rot; a[b+22]=kind; a[b+23]=0;
+  return i+1;
+}
+function updateDynamic(arr, t, dt){
+  let i=0;
+  for(const p of petals){
+    p.x += 0.05 + Math.sin(t*0.9+p.ph)*0.06;
+    p.z += 0.03 + Math.cos(t*0.7+p.ph*1.3)*0.05;
+    p.y -= p.fall + Math.sin(t*1.7+p.ph)*0.02;
+    if (p.y < 0.7 || p.x > 34 || p.z > 34) {
+      p.x = p.tree.x + rrange(-6,6); p.y = p.tree.y + rrange(-1,7); p.z = p.tree.z + rrange(-6,6);
+      if (p.x<-34) p.x=-34; if (p.z<-34) p.z=-34;
+    }
+    i = writeDyn(arr, i, p.x, p.y, p.z, p.s, 0.12, p.s, p.col, p.ph, p.spin, KIND.PETAL);
+  }
+  for(const c of clouds){
+    c.cx += c.vx*dt; if (c.cx > 62) c.cx = -62;
+    for(const q of c.parts) i = writeDyn(arr, i, c.cx+q.dx, c.cy+q.dy, c.cz+q.dz, q.w, q.h, q.d, q.col);
+  }
+  for(const b of birds){
+    b.a += b.sp*dt;
+    const bx = -14 + Math.cos(b.a)*b.r, bz = -12 + Math.sin(b.a)*b.r, by = b.y + Math.sin(t*0.8+b.ph)*1.6;
+    const flap = 0.35 + Math.abs(Math.sin(t*7+b.ph))*0.75;
+    i = writeDyn(arr, i, bx, by, bz, 1.7*b.s, 0.6*b.s, 0.7*b.s, P.bird, b.a+Math.PI/2);
+    for(const s of [-1,1]) i = writeDyn(arr, i, bx, by+0.3, bz+s*0.9*b.s, 0.6*b.s, 0.25*b.s, flap*b.s, P.birdLit, b.a+Math.PI/2);
+    i = writeDyn(arr, i, bx+Math.cos(b.a+Math.PI/2)*1.1*b.s, by+0.15, bz+Math.sin(b.a+Math.PI/2)*1.1*b.s, 0.5*b.s,0.4*b.s,0.5*b.s, P.birdLit, b.a);
+  }
+  for(const b of butts){
+    const bx = b.cx + Math.sin(t*0.6+b.ph)*b.r, by = b.cy + Math.sin(t*1.5+b.ph)*1.6, bz = b.cz + Math.cos(t*0.45+b.ph*1.4)*b.r;
+    const flap = 0.35 + Math.abs(Math.sin(t*8+b.ph))*0.85;
+    i = writeDyn(arr, i, bx, by, bz, 0.35, 0.25, 0.35, jit(P.cream,0.1), t*0.5+b.ph);
+    for(const s of [-1,1]) i = writeDyn(arr, i, bx, by+0.1, bz+s*0.5, 0.9*flap, 0.14, 0.7, b.col, t*0.5+b.ph);
+  }
+  for(const f of flies){
+    const fx = f.cx + Math.sin(t*1.1+f.ph)*f.r, fz = f.cz + Math.cos(t*0.9+f.ph*1.6)*f.r*0.8;
+    const fy = 1.6 + Math.sin(t*2.1+f.ph)*0.5;
+    i = writeDyn(arr, i, fx, fy, fz, 1.2, 0.3, 0.35, P.fly, t*1.1+f.ph);
+    for(const s of [-1,1]) i = writeDyn(arr, i, fx, fy+0.22, fz+s*0.45, 0.5, 0.12, 0.9, hexc('#dff3f6'), t*1.1+f.ph);
+  }
+  for(const k of koi){
+    k.a += k.sp*dt;
+    const dir = k.a + Math.PI/2, wig = Math.sin(t*3+k.ph)*0.25;
+    const kx = POND.x + Math.cos(k.a)*k.r, kz = POND.z + Math.sin(k.a)*k.r, ky = 0.78;
+    for(let s=0;s<3;s++){
+      const off = 1.1 - s*1.1;
+      i = writeDyn(arr, i, kx+Math.cos(dir)*off, ky - s*0.06, kz+Math.sin(dir)*off, 1.15, 0.45, 0.75, k.col, dir);
+    }
+    i = writeDyn(arr, i, kx-Math.cos(dir)*1.6, ky+0.1, kz-Math.sin(dir)*1.6, 0.8, 0.35, 1.1+wig, k.col, dir);
+    i = writeDyn(arr, i, kx+Math.cos(dir)*0.4, ky+0.42, kz+Math.sin(dir)*0.4, 0.5, 0.25, 0.5, jit(P.cream,0.1), dir);
+  }
+  for(const f of falls){
+    f.t += f.sp*dt; if (f.t > 1) f.t = 0;
+    const fy = 7.2 - f.t*6.6, fx = f.x + Math.sin(f.t*2.2+f.ph0||0)*0.5, fz = f.z + f.t*1.6;
+    i = writeDyn(arr, i, fx, fy, fz, f.s, 0.55, f.s, mix(P.waterLit, P.foam, 0.4+f.t*0.4), 0, 0, KIND.WATER, 0, f.t*7);
+  }
+  for(let i2=0;i2<10;i2++){
+    const a = i2*0.7;
+    i = writeDyn(arr, i, POND.x-4+Math.cos(a+t*0.3)*2.2, 0.85+Math.sin(t*2+i2)*0.12, POND.z+4+Math.sin(a+t*0.25)*2.2,
+      1.3, 0.3, 1.3, P.foam, 0, 0, KIND.WATER, 0, i2);
+  }
+  return i;
+}
+
+/* ============================ WEBGL ============================ */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias:true, powerPreference:'high-performance' });
+if (!gl) {
+  const d = document.createElement('div'); d.className='err';
+  d.textContent = 'This page needs WebGL2 — try Chrome.'; document.body.appendChild(d);
+  throw new Error('WebGL2 unavailable');
+}
+
+const SUN = (()=>{ const v=[0.48,0.72,-0.42]; const l=Math.hypot(v[0],v[1],v[2]); return [v[0]/l,v[1]/l,v[2]/l]; })();
+const FOG = mix(hexc('#c9b6a2'), hexc('#9fb2c4'), 0.35);
+
+/* cube geometry: 36 verts, interleaved pos, normal, corner index */
+function buildCube(){
+  const faces = [
+    {n:[1,0,0],  v:[[0.5,-0.5,-0.5],[0.5,0.5,-0.5],[0.5,0.5,0.5],[0.5,-0.5,0.5]]},
+    {n:[-1,0,0], v:[[-0.5,-0.5,0.5],[-0.5,0.5,0.5],[-0.5,0.5,-0.5],[-0.5,-0.5,-0.5]]},
+    {n:[0,1,0],  v:[[-0.5,0.5,-0.5],[0.5,0.5,-0.5],[0.5,0.5,0.5],[-0.5,0.5,0.5]]},
+    {n:[0,-1,0], v:[[-0.5,-0.5,0.5],[0.5,-0.5,0.5],[0.5,-0.5,-0.5],[-0.5,-0.5,-0.5]]},
+    {n:[0,0,1],  v:[[-0.5,-0.5,0.5],[0.5,-0.5,0.5],[0.5,0.5,0.5],[-0.5,0.5,0.5]]},
+    {n:[0,0,-1], v:[[0.5,-0.5,-0.5],[-0.5,-0.5,-0.5],[-0.5,0.5,-0.5],[0.5,0.5,-0.5]]},
+  ];
+  const out = [];
+  for(const f of faces){
+    const tri = [0,1,2, 0,2,3];
+    // fix winding so cross product matches the face normal
+    const a=f.v[tri[0]], b=f.v[tri[1]], c=f.v[tri[2]];
+    const cr = [(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]),
+                -( (b[0]-a[0])*(c[2]-a[2])-(b[2]-a[2])*(c[0]-a[0]) ),
+                (b[0]-a[0])*(c[2]-a[2])-(b[2]-a[2])*(c[0]-a[0])];
+    const dot = cr[0]*f.n[0]+cr[1]*f.n[1]+cr[2]*f.n[2];
+    const order = dot >= 0 ? tri : [tri[0],tri[2],tri[1], tri[0],tri[3],tri[2]];
+    for(const idx of order){
+      const p=f.v[idx], ci = (p[0]<0?0:4)+(p[1]<0?0:2)+(p[2]<0?0:1);
+      out.push(p[0],p[1],p[2], f.n[0],f.n[1],f.n[2], ci);
+    }
+  }
+  return new Float32Array(out);
+}
+
+const VS_BOX = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNrm;
+layout(location=2) in float aCorner;
+layout(location=3) in vec3 iPos;
+layout(location=4) in vec3 iScale;
+layout(location=5) in vec3 iCol;
+layout(location=6) in vec4 iAO0;
+layout(location=7) in vec4 iAO1;
+layout(location=8) in vec4 iMisc;
+layout(location=9) in vec2 iRK;
+uniform mat4 uProj, uView;
+uniform float uTime;
+out vec3 vCol, vN, vW;
+out float vAO, vSh, vKind;
+void main(){
+  vec3 l = aPos * iScale;
+  float ang = iRK.x + iMisc.w * uTime;
+  float c = cos(ang), s = sin(ang);
+  vec3 p = vec3(l.x*c - l.z*s, l.y, l.x*s + l.z*c);
+  vec3 n = vec3(aNrm.x*c - aNrm.z*s, aNrm.y, aNrm.x*s + aNrm.z*c);
+  float k = iRK.y;
+  if (k > 1.5 && k < 2.5) {
+    float ph = iMisc.z, a = iMisc.y;
+    p += vec3(sin(uTime*1.4+ph), sin(uTime*2.0+ph*0.7)*0.35, cos(uTime*1.1+ph*1.6)) * a;
+  } else if (k > 0.5 && k < 1.5) {
+    p.y += sin(uTime*1.7 + p.x*0.5 + p.z*0.4)*0.10 + sin(uTime*2.2 + p.z*0.9 - p.x*0.25)*0.05;
+  }
+  vec3 w = p + iPos;
+  vW = w; vN = n; vCol = iCol; vKind = k; vSh = iMisc.x;
+  int ci = int(aCorner);
+  vAO = ci < 4 ? iAO0[ci] : iAO1[ci-4];
+  gl_Position = uProj * uView * vec4(w, 1.0);
+}`;
+
+const FS_BOX = `#version 300 es
+precision highp float;
+uniform vec3 uCamPos, uSunDir, uFogCol;
+uniform float uTime;
+uniform vec2 uRes;
+in vec3 vCol, vN, vW;
+in float vAO, vSh, vKind;
+out vec4 frag;
+void main(){
+  vec3 n = normalize(vN);
+  vec3 v = normalize(uCamPos - vW);
+  vec3 s = uSunDir;
+  float ndl = max(dot(n,s), 0.0);
+  float wrap = clamp(dot(n,s)*0.8 + 0.28, 0.0, 1.0);
+  vec3 skyAmb = vec3(0.44, 0.58, 0.78);
+  vec3 bounce  = vec3(0.46, 0.42, 0.33);
+  vec3 amb = mix(bounce, skyAmb, n.y*0.5+0.5);
+  float ao = vAO*0.62 + 0.38;
+  float sh = vSh*0.62 + 0.38;
+  vec3 col = vCol * (amb*0.95 + vec3(1.35,1.12,0.86)*(wrap*0.5 + ndl*0.7)*sh) * ao;
+  float rim = pow(max(dot(v,s), 0.0), 3.0);
+  if (vKind > 1.5 && vKind < 2.5) col += vCol*rim*0.85 + vCol*0.10;
+  if (vKind > 0.5 && vKind < 1.5) {
+    vec3 wn = normalize(n + vec3(sin(vW.x*1.5+uTime*2.2)*0.20 + sin(vW.z*2.3-uTime*1.3)*0.10, 0.0, cos(vW.z*1.7-uTime*1.9)*0.20));
+    float fres = pow(1.0 - max(dot(wn,v),0.0), 3.0);
+    float spec = pow(max(dot(reflect(-s,wn), v), 0.0), 48.0);
+    col = mix(col*0.85, vec3(0.50,0.74,0.92), fres*0.6) + vec3(1.0,0.95,0.82)*spec*1.1;
+  }
+  if (vKind > 2.5 && vKind < 3.5) col = vCol*1.55 + vCol*rim*0.35;
+  if (vKind > 3.5 && vKind < 4.5) col += vCol*rim*0.8;
+  float d = length(uCamPos - vW);
+  float fog = 1.0 - exp(-pow(d*0.0145, 2.1));
+  col = mix(col, uFogCol, fog*0.9);
+  vec2 uv = gl_FragCoord.xy/uRes;
+  col *= 1.0 - 0.34*smoothstep(0.32, 0.95, length(uv-0.5)*1.18);
+  col += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453) - 0.5)*0.004;
+  frag = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+const VS_SKY = `#version 300 es
+precision highp float;
+void main(){
+  float x = float(gl_VertexID & 1), y = float((gl_VertexID >> 1) & 1);
+  gl_Position = vec4(x*2.0-1.0, y*2.0-1.0, 1.0, 1.0);
+}`;
+const FS_SKY = `#version 300 es
+precision highp float;
+uniform vec3 uCamPos, uRight, uUp, uFwd, uSunDir;
+uniform vec2 uRes;
+uniform float uTime, uFovTan;
+out vec4 frag;
+float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
+float vn(vec2 p){ vec2 i=floor(p), f=p-i; f=f*f*(3.0-2.0*f);
+  return mix(mix(h21(i), h21(i+vec2(1,0)), f.x), mix(h21(i+vec2(0,1)), h21(i+vec2(1,1)), f.x), f.y); }
+void main(){
+  vec2 ndc = gl_FragCoord.xy/uRes*2.0 - 1.0;
+  vec3 rd = normalize(uFwd + uRight*ndc.x*(uRes.x/uRes.y)*uFovTan + uUp*ndc.y*uFovTan);
+  float el = rd.y;
+  float sa = max(dot(normalize(rd.xz + vec2(0.0001)), normalize(uSunDir.xz)), 0.0);
+  vec3 zen = vec3(0.26, 0.47, 0.78);
+  vec3 mid = vec3(0.56, 0.74, 0.88);
+  vec3 hor = mix(vec3(0.80,0.79,0.73), vec3(1.00,0.74,0.50), pow(sa, 2.4));
+  float t = clamp(el, 0.0, 1.0);
+  vec3 col = mix(hor, mid, smoothstep(0.0, 0.30, t));
+  col = mix(col, zen, smoothstep(0.26, 0.85, t));
+  if (el < 0.0) col = mix(col, vec3(0.66,0.63,0.58), smoothstep(0.0, -0.4, el));
+  float da = dot(rd, uSunDir);
+  col += vec3(1.0,0.94,0.76) * smoothstep(0.9955, 0.9995, da) * 1.7;
+  col += vec3(1.0,0.78,0.52) * pow(max(da,0.0), 22.0) * 0.4;
+  col += vec3(1.0,0.60,0.36) * pow(max(da,0.0), 6.0) * 0.14;
+  float c = vn(rd.xz/(max(el,0.05)*3.2) + uTime*0.02);
+  float band = smoothstep(0.42, 0.78, c) * smoothstep(-0.04, 0.22, el) * (1.0 - smoothstep(0.5, 0.92, el));
+  col = mix(col, vec3(0.97,0.95,0.93), band*0.55);
+  vec2 uv = gl_FragCoord.xy/uRes;
+  col *= 1.0 - 0.26*smoothstep(0.32, 0.95, length(uv-0.5)*1.18);
+  frag = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+function compile(vs, fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, gl.createShader(gl.VERTEX_SHADER)); gl.shaderSource(p, vs); gl.compileShader(p);
+  gl.attachShader(p, gl.createShader(gl.FRAGMENT_SHADER)); gl.shaderSource(p, fs); gl.compileShader(p);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+const progBox = compile(VS_BOX, FS_BOX);
+const progSky = compile(VS_SKY, FS_SKY);
+
+/* ---------- bake ambient occlusion + sun shadows ---------- */
+const OCC = new Map();
+const occTop = [];
+function keyOf(x,y,z){ return (x+96) + (y+96)*200 + (z+96)*40000; }
+function bakeOccupancy(){
+  for(let i=0;i<objs.length;i++){
+    const o=objs[i];
+    const ix=Math.round(o.x), iy=Math.round(o.y), iz=Math.round(o.z);
+    const iw=Math.max(1,Math.round(o.w)), ih=Math.max(1,Math.round(o.h)), id=Math.max(1,Math.round(o.d));
+    occTop[i] = iy+ih;
+    if (iw*ih*id > 26) continue;
+    for(let dx=0;dx<iw;dx++) for(let dy=0;dy<ih;dy++) for(let dz=0;dz<id;dz++)
+      OCC.set(keyOf(ix+dx, iy+dy, iz+dz), i);
+  }
+}
+function occAt(x,y,z,self){
+  const i = OCC.get(keyOf(x,y,z));
+  if (i === undefined || i === self) return false;
+  return occTop[i] > y+1;   // only strictly taller neighbours occlude
+}
+function bakeAO(o, self){
+  const ix=Math.round(o.x), iy=Math.round(o.y), iz=Math.round(o.z);
+  const iw=Math.max(1,Math.round(o.w)), ih=Math.max(1,Math.round(o.h)), id=Math.max(1,Math.round(o.d));
+  const ao = new Array(8);
+  for(let ci=0; ci<8; ci++){
+    const dx = (ci&4)?1:-1, dy=(ci&2)?1:-1, dz=(ci&1)?1:-1;
+    const cx = ix + (dx>0 ? iw-1 : 0), cy = iy + (dy>0 ? ih-1 : 0), cz = iz + (dz>0 ? id-1 : 0);
+    const s1 = occAt(cx+dx, cy+dy, cz, self);
+    const s2 = occAt(cx+dx, cy, cz+dz, self);
+    const s3 = occAt(cx, cy+dy, cz+dz, self);
+    if (s1||s2||s3) { ao[ci]=0; continue; }
+    ao[ci] = occAt(cx+dx, cy+dy, cz+dz, self) ? 0.45 : 1;
+  }
+  return ao;
+}
+function bakeShadow(o, self){
+  if (o.kind === KIND.GLOW) return 1;
+  const ix=Math.round(o.x), iy=Math.round(o.y), iz=Math.round(o.z);
+  const iw=Math.max(1,Math.round(o.w)), ih=Math.max(1,Math.round(o.h)), id=Math.max(1,Math.round(o.d));
+  let sx = ix+(iw-1)/2, sy = iy+ih-0.5, sz = iz+(id-1)/2;
+  const step = 0.55;
+  for(let k=1;k<=22;k++){
+    const px = Math.round(sx+SUN[0]*step*k), py = Math.round(sy+SUN[1]*step*k), pz = Math.round(sz+SUN[2]*step*k);
+    const i = OCC.get(keyOf(px,py,pz));
+    if (i !== undefined && i !== self) return clamp(1 - 0.45*(1 - k/22), 0.5, 1);
+  }
+  return 1;
+}
+
+/* ---------- buffers ---------- */
+const cubeVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, cubeVBO);
+gl.bufferData(gl.ARRAY_BUFFER, buildCube(), gl.STATIC_DRAW);
+
+function makeVAO(instBuf){
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cubeVBO);
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,12,0);  gl.vertexAttribDivisor(0,0); gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(1,3,gl.FLOAT,false,12,12); gl.vertexAttribDivisor(1,0); gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(2,1,gl.FLOAT,false,12,24); gl.vertexAttribDivisor(2,0); gl.enableVertexAttribArray(2);
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  const S = 96;
+  const set = (loc,size,off)=>{ gl.vertexAttribPointer(loc,size,gl.FLOAT,false,S,off*4); gl.vertexAttribDivisor(loc,1); gl.enableVertexAttribArray(loc); };
+  set(3,3,0); set(4,3,3); set(5,3,6); set(6,4,9); set(7,4,13); set(8,4,17); set(9,2,21);
+  gl.bindVertexArray(null);
+  return vao;
+}
+
+/* ---------- build the whole scene ---------- */
+buildTerrain();
+buildMountains();
+buildPagoda(-14,-12, 4.6);
+buildTrees();
+buildPond();
+buildStream();
+buildWaterfall();
+buildRocks();
+buildPath();
+buildWallFence();
+buildDetails();
+buildGrassAndFlowers();
+makeDynamic();
+
+bakeOccupancy();
+const staticArr = new Float32Array(objs.length*24);
+for(let i=0;i<objs.length;i++){
+  const o=objs[i], b=i*24;
+  const ao = (o.kind===KIND.WATER) ?

@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voxel Pagoda Garden</title>
+<style>
+  * { margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+/**
+ * Voxel Pagoda Garden - elaborate isometric voxel scene
+ * Pure Canvas 2D rendering (no WebGL/GPU dependency) so it works under
+ * software-rendered headless Chrome.
+ */
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { alpha: false });
+let W, H;
+
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ============ VOXEL ENGINE ============
+// Isometric dimetric projection:
+//   sx = (x - z) * HW
+//   sy = (x + z) * HT - y * TH
+// where each voxel is HW*2 wide and HT*2 tall on the top face.
+const HW = 16;   // half top-face width
+const HT = 8;    // half top-face height
+const TH = HT * 2; // full top-face height (=16)
+
+const voxels = new Map(); // key "x,y,z" -> color string
+
+function vkey(x, y, z) { return x + ',' + y + ',' + z; }
+function getV(x, y, z) { return voxels.get(vkey(x, y, z)); }
+function setV(x, y, z, c) {
+  if (c === null) voxels.delete(vkey(x, y, z));
+  else voxels.set(vkey(x, y, z), c);
+}
+
+// Pre-rendered face paths (Path2D is much faster than rebuild-each-frame)
+const topPath = new Path2D();
+topPath.moveTo(0, 0);
+topPath.lineTo(HW, HT);
+topPath.lineTo(0, TH);
+topPath.lineTo(-HW, HT);
+topPath.closePath();
+
+const sidePath = new Path2D();
+sidePath.moveTo(0, 0);
+sidePath.lineTo(-HW, HT);
+sidePath.lineTo(-HW, -HT);
+sidePath.lineTo(0, -TH);
+sidePath.closePath();
+
+// Lighten / darken a hex color
+function shade(hex, amount) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  const f = 1 + amount;
+  return '#' +
+    Math.max(0, Math.min(255, Math.round(r * f))).toString(16).padStart(2, '0') +
+    Math.max(0, Math.min(255, Math.round(g * f))).toString(16).padStart(2, '0') +
+    Math.max(0, Math.min(255, Math.round(b * f))).toString(16).padStart(2, '0');
+}
+
+// ============ PALETTE ============
+const C = {
+  // Pagoda
+  wood: '#5D4037', woodDark: '#3E2723', woodLight: '#795548',
+  red: '#C0392B', redDark: '#A32D21',
+  gold: '#D4AF37', goldDark: '#B8860B',
+  // Trees
+  greenDark: '#1B5E20', greenMid: '#2E7D32', greenLight: '#66BB6A', greenLime: '#9CC53D',
+  brown: '#5D4037', brownDark: '#3E2723',
+  // Cherry blossoms
+  pink: '#F48FB1', pinkLight: '#F9A8B5', pinkDark: '#E1B2CE', pinkHot: '#EC407A',
+  // Ground
+  grass: '#4CAF50', grassDark: '#2E7D32', grassLight: '#81C784',
+  dirt: '#8D6E63', path: '#B7950B', pathLight: '#D4B482', pathDark: '#7F8C8D',
+  // Pond
+  water: '#42A5F5', waterDark: '#1E88E5',
+  // Sky / decor
+  sky: '#E3F2FD', skyDark: '#BBDEFB', sun: '#FFF59D',
+  lantern: '#FFD700', lanternDark: '#B8860B'
+};
+
+// ============ SCENE BUILDERS ============
+function fillBox(x0, y0, z0, x1, y1, z1, color) {
+  for (let x = x0; x <= x1; x++)
+    for (let y = y0; y <= y1; y++)
+      for (let z = z0; z <= z1; z++)
+        setV(x, y, z, color);
+}
+
+function addTree(cx, cz, height, radius, trunkColor, foliageColors) {
+  // Trunk (3x3 column)
+  for (let y = 0; y < height; y++) {
+    for (let dx = -1; dx <= 1; dx++)
+      for (let dz = -1; dz <= 1; dz++)
+        if (Math.abs(dx) + Math.abs(dz) <= 1)
+          setV(cx + dx, y, cz + dz, trunkColor);
+  }
+  // Spherical-ish foliage
+  const fy = height - 2;
+  for (let x = cx - radius; x <= cx + radius; x++) {
+    for (let z = cz - radius; z <= cz + radius; z++) {
+      const dist = Math.sqrt((x - cx) ** 2 + (z - cz) ** 2);
+      if (dist > radius) continue;
+      const h = Math.floor(fy + radius * 0.4 - dist * 0.4);
+      for (let y = Math.max(1, fy - 3); y <= h; y++) {
+        setV(x, y, z, foliageColors[(x + z + y) % foliageColors.length]);
+      }
+    }
+  }
+}
+
+function addCherryTree(cx, cz, height, radius) {
+  addTree(cx, cz, height, radius, C.brownDark,
+    [C.pink, C.pinkLight, C.pinkDark, C.pinkHot]);
+  // Fallen petals on the ground
+  for (let i = 0; i < 25; i++) {
+    const px = Math.round(cx + (Math.random() * 10 - 5));
+    const pz = Math.round(cz + (Math.random() * 10 - 5));
+    if (getV(px, 0, pz) === undefined && Math.abs(px) > 12 && Math.abs(pz) > 12)
+      setV(px, 0, pz, C.pinkLight);
+  }
+}
+
+function addPagodaRoof(cx, cz, r, baseH, colors) {
+  // colors: [center, edge, corner]
+  const maxRise = 6;
+  // Curved roof surface
+  for (let x = cx - r; x <= cx + r; x++) {
+    for (let z = cz - r; z <= cz + r; z++) {
+      const dist = Math.max(Math.abs(x - cx), Math.abs(z - cz));
+      const t = dist / r;
+      const h = baseH + Math.floor(maxRise * t * t);
+      let color;
+      if (Math.abs(x - cx) === r && Math.abs(z - cz) === r) color = colors[2];
+      else if (Math.abs(x - cx) === r || Math.abs(z - cz) === r) color = colors[1];
+      else color = colors[0];
+      setV(x, h, z, color);
+    }
+  }
+  // Corner pillars that curve upward
+  const corners = [[cx - r, cz - r], [cx + r, cz - r], [cx + r, cz + r], [cx - r, cz + r]];
+  for (let [cx_, cz_] of corners) {
+    for (let h = baseH + 1; h <= baseH + maxRise; h++) setV(cx_, h, cz_, colors[2]);
+    for (let i = 1; i <= 3; i++) {
+      const h = baseH + Math.floor(maxRise * i / 4);
+      const off = i;
+      setV(cx_ + (cx_ < cx ? off : -off), h, cz_, colors[2]);
+      setV(cx_, h, cz_ + (cz_ < cz ? off : -off), colors[2]);
+    }
+  }
+}
+
+function addTier(cx, cz, size, baseH, tierH, bodyColor, roofColors) {
+  fillBox(cx - size, baseH, cz - size, cx + size, baseH + tierH - 1, cz + size, bodyColor);
+  addPagodaRoof(cx, cz, size + 2, baseH + tierH, roofColors);
+}
+
+function addLantern(cx, y, cz) {
+  setV(cx, y, cz, C.lanternDark);
+  setV(cx, y + 1, cz, C.lanternDark);
+  setV(cx, y + 2, cz, C.lantern);
+  setV(cx, y + 3, cz, C.lanternDark);
+  setV(cx, y + 4, cz, C.gold);
+  setV(cx - 1, y + 4, cz, C.gold);
+  setV(cx + 1, y + 4, cz, C.gold);
+  setV(cx, y + 4, cz - 1, C.gold);
+  setV(cx, y + 4, cz + 1, C.gold);
+}
+
+// ============ BUILD THE SCENE ============
+function buildScene() {
+  voxels.clear();
+
+  // ---- Ground: grass ----
+  for (let x = -40; x <= 40; x++) {
+    for (let z = -40; z <= 40; z++) {
+      const m = (x + z) % 3;
+      setV(x, 0, z, m === 0 ? C.grass : m === 1 ? C.grassDark : C.grassLight);
+    }
+  }
+
+  // ---- Pond ----
+  fillBox(-16, 0, -10, 10, 0, 4, C.water);
+  for (let x = -17; x <= 11; x++) {
+    setV(x, 0, -11, C.waterDark);
+    setV(x, 0, 5, C.waterDark);
+  }
+  for (let z = -11; z <= 5; z++) {
+    setV(-17, 0, z, C.waterDark);
+    setV(11, 0, z, C.waterDark);
+  }
+
+  // ---- Stone bridge over pond ----
+  for (let x = -16; x <= 10; x++) {
+    setV(x, 1, -10, C.wood);
+    setV(x, 1, 4, C.wood);
+  }
+  for (let z = -10; z <= 4; z++) {
+    setV(-16, 1, z, C.wood);
+    setV(10, 1, z, C.wood);
+  }
+  for (let x = -16; x <= 10; x += 3) {
+    setV(x, 2, -10, C.woodDark);
+    setV(x, 2, 4, C.woodDark);
+  }
+
+  // ---- Winding path ----
+  for (let z = -35; z <= 35; z++) {
+    const x = -4 + Math.sin(z * 0.25) * 2;
+    for (let dx = -1; dx <= 1; dx++) setV(Math.round(x) + dx, 0, z, C.path);
+  }
+  for (let x = -25; x <= 25; x++) {
+    const z = 8 + Math.sin(x * 0.2) * 1.5;
+    for (let dz = -1; dz <= 1; dz++) setV(x, 0, Math.round(z) + dz, C.path);
+  }
+  // Path edges
+  for (let z = -35; z <= 35; z++) {
+    const x = -4 + Math.sin(z * 0.25) * 2;
+    setV(Math.round(x) - 2, 0, z, C.pathDark);
+    setV(Math.round(x) + 2, 0, z, C.pathDark);
+  }
+
+  // ---- Trees ----
+  addTree(-38, -38, 10, 6, C.brown, [C.greenDark, C.greenMid, C.greenLight]);
+  addTree(38, -38, 11, 7, C.brown, [C.greenDark, C.greenMid, C.greenLight, C.greenLime]);
+  addTree(-38, 38, 9, 5, C.brown, [C.greenDark, C.greenMid, C.greenLight]);
+  addTree(35, 35, 10, 6, C.brown, [C.greenDark, C.greenMid, C.greenLight]);
+  addTree(0, -32, 8, 5, C.brown, [C.greenDark, C.greenMid]);
+  addTree(0, 32, 9, 6, C.brown, [C.greenDark, C.greenMid, C.greenLight]);
+  addTree(-28, 0, 11, 7, C.brown, [C.greenDark, C.greenMid, C.greenLight, C.greenLime]);
+  addTree(28, 0, 10, 6, C.brown, [C.greenDark, C.greenMid, C.greenLight]);
+
+  // ---- Cherry blossom trees ----
+  addCherryTree(-22, -22, 9, 6);
+  addCherryTree(22, -22, 10, 7);
+  addCherryTree(-16, 22, 8, 5);
+  addCherryTree(16, 22, 9, 6);
+  addCherryTree(0, 2, 12, 8);
+
+  // ---- Pagoda ----
+  const PX = 0, PZ = 0;
+  fillBox(PX - 14, 0, PZ - 14, PX + 14, 2, PZ + 14, C.woodDark);
+
+  addTier(PX, PZ, 10, 2, 4, C.wood, [C.red, C.redDark, C.gold]);
+  addLantern(PX - 11, 6, PZ - 11);
+  addLantern(PX + 11, 6, PZ - 11);
+  addLantern(PX - 11, 6, PZ + 11);
+  addLantern(PX + 11, 6, PZ + 11);
+
+  addTier(PX, PZ, 7, 6, 3, C.wood, [C.red, C.redDark, C.gold]);
+  addLantern(PX - 8, 9, PZ - 8);
+  addLantern(PX + 8, 9, PZ - 8);
+  addLantern(PX - 8, 9, PZ + 8);
+  addLantern(PX + 8, 9, PZ + 8);
+
+  addTier(PX, PZ, 4, 9, 3, C.wood, [C.red, C.redDark, C.gold]);
+  addLantern(PX - 5, 12, PZ - 5);
+  addLantern(PX + 5, 12, PZ - 5);
+  addLantern(PX - 5, 12, PZ + 5);
+  addLantern(PX + 5, 12, PZ + 5);
+
+  addTier(PX, PZ, 2, 12, 3, C.wood, [C.red, C.redDark, C.gold]);
+  addTier(PX, PZ, 1, 15, 2, C.wood, [C.red, C.redDark, C.gold]);
+
+  // Spire
+  for (let y = 17; y <= 20; y++) setV(PX, y, PZ, C.gold);
+  setV(PX, 21, PZ, C.goldDark);
+  setV(PX - 1, 21, PZ, C.goldDark);
+  setV(PX + 1, 21, PZ, C.goldDark);
+  setV(PX, 21, PZ - 1, C.goldDark);
+  setV(PX, 21, PZ + 1, C.goldDark);
+
+  // ---- Rocks ----
+  for (let i = 0; i < 12; i++) {
+    const rx = Math.floor(Math.random() * 50) - 25;
+    const rz = Math.floor(Math.random() * 50) - 25;
+    if (getV(rx, 0, rz) === undefined && Math.abs(rx) > 18 && Math.abs(rz) > 18) {
+      setV(rx, 0, rz, C.dirt);
+      if (getV(rx + 1, 0, rz) === undefined) setV(rx + 1, 0, rz, C.dirt);
+      if (getV(rx, 0, rz + 1) === undefined) setV(rx, 0, rz + 1, C.dirt);
+    }
+  }
+
+  // ---- Flowers ----
+  for (let i = 0; i < 35; i++) {
+    const fx = Math.floor(Math.random() * 70) - 35;
+    const fz = Math.floor(Math.random() * 70) - 35;
+    if (getV(fx, 0, fz) !== undefined && Math.abs(fx) > 16 && Math.abs(fz) > 16) {
+      setV(fx, 0, fz, [C.pinkHot, C.red, C.gold, C.greenLime][Math.floor(Math.random() * 4)]);
+    }
+  }
+}
+
+// ============ RENDER ============
+let angle = 0;
+const ROT_SPEED = 0.0015;
+
+function render() {
+  // Sky gradient
+  const grad = ctx.createLinearGradient(0, 0, 0, H * 0.6);
+  grad.addColorStop(0, C.sky);
+  grad.addColorStop(1, C.skyDark);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H * 0.6 + 30);
+
+  // Sun
+  ctx.fillStyle = C.sun;
+  ctx.beginPath();
+  ctx.arc(W * 0.78, H * 0.18, 36, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Ground shadow / fog
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
+  ctx.fillRect(0, H * 0.5 + 30, W, H * 0.5 + 40);
+
+  // Build render list with projected positions
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  const items = [];
+
+  for (const [key, color] of voxels) {
+    const [x, y, z] = key.split(',').map(Number);
+    const xr = x * c - z * s;
+    const zr = x * s + z * c;
+    const sx = W / 2 + (xr - zr) * HW;
+    const sy = H / 2 + (xr + zr) * HT - y * TH + 90;
+
+    // Frustum culling
+    if (sx + HW < -60 || sx - HW > W + 60 || sy + TH < -60 || sy - TH > H + 60) continue;
+
+    items.push({ x, y, z, color, sx, sy, depth: xr + zr });
+  }
+
+  // Back-to-front sort by depth
+  items.sort((a, b) => a.depth - b.depth);
+
+  for (const it of items) {
+    const { x, y, z, color, sx, sy } = it;
+    if (color === undefined) continue;
+    ctx.translate(sx, sy);
+    // Top face (visible if nothing directly above)
+    if (!getV(x, y + 1, z)) {
+      ctx.fillStyle = color;
+      ctx.fill(topPath);
+    }
+    // Left face (normal -x)
+    if (!getV(x - 1, y, z)) {
+      ctx.fillStyle = shade(color, -0.3);
+      ctx.fill(sidePath);
+    }
+    // Right face (normal +x) — drawn at (HW, HT) offset
+    if (!getV(x + 1, y, z)) {
+      ctx.fillStyle = shade(color, 0.3);
+      ctx.translate(HW, HT);
+      ctx.fill(sidePath);
+      ctx.translate(-HW, -HT);
+    }
+    ctx.translate(-sx, -sy);
+  }
+}
+
+function animate() {
+  angle += ROT_SPEED;
+  render();
+  requestAnimationFrame(animate);
+}
+
+// Build and start
+buildScene();
+animate();
+</script>
+</body>
+</html>

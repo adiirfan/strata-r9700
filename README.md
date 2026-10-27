@@ -42,8 +42,8 @@ own counts in tokens per second; first-token times are measured by the client.
 - **DeepSeek:** the leave-out setting at 0.20 and 24K prompt chunks (see [DeepSeek-V4.1-Flash](#deepseek-v41-flash)).
   *72 GB store*: a 72 GB RAM store, no cap (about 80 GB of RAM in all). *48 GB cap* and *32 GB cap*: the whole server
   held to that much RAM by the system (systemd `MemoryMax`), with a 38 GB and a 21 GB store.
-- **GLM:** the leave-out setting at 0.12 on every layer and prompt chunks of up to 32K tokens (see
-  [GLM-5.3-Flash](#glm-53-flash)). *All in RAM*: every expert on the card or in RAM bar a few on the SSD (about 83 GB in
+- **GLM:** no experts left out and prompt chunks of up to 32K tokens (see [GLM-5.3-Flash](#glm-53-flash) for why
+  nothing is left out). *All in RAM*: every expert on the card or in RAM bar a few on the SSD (about 83 GB in
   all). *48 GB cap* and *32 GB cap*: the whole server held to that much RAM, with a 36 GB and a 24 GB expert store.
 - **Qwen:** *all in RAM*: every expert in RAM (about 55 GB). *32 GB cap* and *16 GB cap*: the whole server held to that
   much RAM, with 20 GB and 5 GB of experts in RAM and the rest read from the SSD.
@@ -56,17 +56,17 @@ own counts in tokens per second; first-token times are measured by the client.
 
 | Test | DeepSeek, 72 GB store | DeepSeek, 48 GB cap | DeepSeek, 32 GB cap | GLM, all in RAM | GLM, 48 GB cap | GLM, 32 GB cap | Qwen, all in RAM | Qwen, 32 GB cap | Qwen, 16 GB cap | Nemotron | Flint |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Chat: writing (tokens/s) | 17.9 | 15.3 | 12.0 | 28.4 | 22.1 | 17.8 | 78.3 | 60.1 | 40.9 | 124.4 | 238.0 |
-| Chat: first token | 2.67 s | 3.28 s | 4.05 s | 1.35 s | 2.87 s | 4.05 s | 0.49 s | 0.57 s | 0.89 s | 0.12 s | 0.07 s |
-| 4K prompt: reading (tokens/s) | 720 | 595 | 506 | 884 | 436 | 347 | 2,332 | 1,382 | 504 | 4,930 | 6,829 |
-| 4K prompt: first token | 5.73 s | 6.94 s | 8.15 s | 4.61 s | 9.28 s | 11.66 s | 1.75 s | 2.93 s | 7.99 s | 0.84 s | 0.60 s |
-| 16K prompt: reading (tokens/s) | 1,176 | 1,286 | 1,218 | 989 | 968 | 921 | 3,246 | 2,692 | 1,587 | 5,237 | 6,506 |
-| 16K prompt: first token | 14.11 s | 12.90 s | 13.61 s | 19.07 s | 16.71 s | 17.60 s | 4.98 s | 6.00 s | 10.15 s | 3.16 s | 2.54 s |
-| 32K prompt: reading (tokens/s) | 1,064 | 1,389 | 1,326 | 977 | 966 | 908 | 3,380 | 2,708 | 2,120 | 4,990 | 5,721 |
-| 32K prompt: first token | 31.18 s | 23.89 s | 25.01 s | 35.77 s | 33.42 s | 35.54 s | 9.52 s | 11.87 s | 15.16 s | 6.62 s | 5.76 s |
+| Chat: writing (tokens/s) | 17.9 | 15.3 | 12.0 | 17.4 | 7.9 | 6.2 | 78.3 | 60.1 | 40.9 | 124.4 | 238.0 |
+| Chat: first token | 2.67 s | 3.28 s | 4.05 s | 1.42 s | 3.30 s | 4.35 s | 0.49 s | 0.57 s | 0.89 s | 0.12 s | 0.07 s |
+| 4K prompt: reading (tokens/s) | 720 | 595 | 506 | 883 | 430 | 328 | 2,332 | 1,382 | 504 | 4,930 | 6,829 |
+| 4K prompt: first token | 5.73 s | 6.94 s | 8.15 s | 4.60 s | 9.44 s | 12.36 s | 1.75 s | 2.93 s | 7.99 s | 0.84 s | 0.60 s |
+| 16K prompt: reading (tokens/s) | 1,176 | 1,286 | 1,218 | 989 | 950 | 906 | 3,246 | 2,692 | 1,587 | 5,237 | 6,506 |
+| 16K prompt: first token | 14.11 s | 12.90 s | 13.61 s | 21.09 s | 17.04 s | 17.88 s | 4.98 s | 6.00 s | 10.15 s | 3.16 s | 2.54 s |
+| 32K prompt: reading (tokens/s) | 1,064 | 1,389 | 1,326 | 971 | 939 | 890 | 3,380 | 2,708 | 2,120 | 4,990 | 5,721 |
+| 32K prompt: first token | 31.18 s | 23.89 s | 25.01 s | 39.57 s | 34.27 s | 36.27 s | 9.52 s | 11.87 s | 15.16 s | 6.62 s | 5.76 s |
 | Agent session: prompt reused | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 68% |
-| Agent session: first token per turn | 9.89 s | 12.52 s | 15.01 s | 4.34 s | 9.32 s | 11.59 s | 1.60 s | 2.79 s | 7.55 s | 0.62 s | 0.46 s |
-| Agent session: writing (tokens/s) | 12.5 | 12.9 | 11.7 | 25.8 | 21.0 | 17.4 | 76.6 | 71.6 | 58.9 | 97.5 | 206.5 |
+| Agent session: first token per turn | 9.89 s | 12.52 s | 15.01 s | 4.40 s | 9.32 s | 11.86 s | 1.60 s | 2.79 s | 7.55 s | 0.62 s | 0.46 s |
+| Agent session: writing (tokens/s) | 12.5 | 12.9 | 11.7 | 17.5 | 8.7 | 6.5 | 76.6 | 71.6 | 58.9 | 97.5 | 206.5 |
 
 - Nemotron's writing moves with how many of the drafter's guesses the model keeps (105-221 tokens/s over the chats).
 - The agent session reuses 69% of each turn's prompt from the conversation cache in every setup, so its first-token
@@ -118,37 +118,29 @@ model's own tokenizer made of it.
 
 | Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K (1,076) | 287 | 3.9 s | 24.5 | 26.7 |
-| 4K (4,176) | 843 | 5.1 s | 25.9 | 26.0 |
-| 16K (14,724) | 991 | 15.0 s | 25.6 | 25.6 |
-| 32K (30,537) | 978 | 31.4 s | 24.6 | 25.6 |
-| 64K (63,822) | 951 | 69.8 s | 25.2 | 25.3 |
-| 128K (123,356) | 902 | 149.5 s | 24.0 | 23.8 |
-| 256K (231,868) | 818 | 296.7 s | 22.8 | 22.8 |
+| 1K (1,074) | 298 | 3.7 s | 14.7 | 17.1 |
+| 4K (4,177) | 837 | 5.1 s | 16.8 | 17.0 |
+| 16K (14,724) | 986 | 15.1 s | 16.3 | 17.2 |
+| 32K (30,537) | 974 | 31.5 s | 16.1 | 16.8 |
+| 64K (63,821) | 944 | 70.9 s | 16.0 | 16.3 |
+| 128K (123,356) | 901 | 143.2 s | 15.7 | 16.3 |
+| 256K (231,868) | 816 | 299.5 s | 15.2 | 15.6 |
 
 #### GLM, 48 GB cap
 
 | Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K (1,075) | 117 | 9.3 s | 19.3 | 19.8 (721 written) |
-| 4K (4,177) | 447 | 9.5 s | 19.4 | 20.5 |
-| 16K (14,725) | 940 | 15.8 s | 17.7 | 20.0 |
-| 32K (30,536) | 936 | 32.8 s | 17.9 | 19.0 |
-| 64K (63,822) | 920 | 69.7 s | 18.0 | 19.0 |
-| 128K (123,356) | 882 | 140.6 s | 16.6 | 18.7 |
-| 256K (231,868) | 801 | 299.0 s | 16.1 | 15.6 (41 written) |
+| 1K (1,075) | 116 | 9.3 s | 7.2 | 7.9 (1021 written) |
+| 4K (4,177) | 437 | 9.7 s | 7.6 | 7.8 |
+| 16K (14,724) | 891 | 16.6 s | 7.3 | 7.6 |
+| 32K (30,537) | 899 | 34.2 s | 8.6 | 7.7 |
+| 64K (63,822) | 887 | 72.3 s | 7.5 | 7.5 |
+| 128K (123,355) | 864 | 143.4 s | 7.5 | 7.7 |
+| 256K (231,869) | 792 | 293.7 s | 7.4 | 7.5 (13 written) |
 
 #### GLM, 32 GB cap
 
-| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
-| ---: | ---: | ---: | ---: | ---: |
-| 1K (1,075) | 91 | 11.9 s | 16.6 | 16.3 (824 written) |
-| 4K (4,176) | 357 | 11.8 s | 15.3 | 16.6 |
-| 16K (14,725) | 859 | 17.3 s | 15.8 | 15.5 |
-| 32K (30,536) | 867 | 36.4 s | 15.6 | 15.6 |
-| 64K (63,820) | 856 | 74.9 s | 15.1 | 15.9 |
-| 128K (123,354) | 841 | 147.3 s | 14.2 | 15.1 |
-| 256K (231,867) | 775 | 301.4 s | 11.9 | 14.2 |
+Not measured. At this cap GLM writes about 6 tokens/s (Strata's benchmark above).
 
 #### Qwen, all in RAM
 
@@ -213,36 +205,42 @@ model's own tokenizer made of it.
 - **DeepSeek's writing hardly moves with the prompt's length:** what limits it is how many experts per word come from
   the SSD, not the context. Its prompts start slowly because every chunk streams the experts the card does not hold,
   about 110 GB, so a short prompt pays for one whole pass.
-- **GLM writes faster than DeepSeek at every RAM size** (it leaves out light experts on every layer, and most of what
-  it needs fits on the card and in RAM), and reads long prompts a little slower: its 34 KDA and 11 DSA layers cost more
-  per token than DeepSeek's attention. With a cap its short prompts slow down like Qwen's, while from 16K on it
-  loses little.
+- **GLM writes about as fast as DeepSeek with all its experts in RAM, and about half as fast under a cap:** GLM
+  fetches every expert it needs, while DeepSeek leaves out the cold ones it would read from the SSD. GLM reads long
+  prompts a little slower: its 34 KDA and 11 DSA layers cost more per token than DeepSeek's attention. With a cap its
+  short prompts slow down like Qwen's, while from 16K on it loses little.
 - **With less RAM,** Qwen's short prompts slow down most (the experts they need come from the SSD); long prompts share
   each pass over the experts among more tokens and lose less.
 
 ### Pagoda test
 
-One creative coding prompt to each model, at its all-in-RAM setting:
+One creative coding task to each model in the [Pi](https://github.com/badlogic/pi-mono) coding agent (0.57.2), which
+lets the model write files and run commands. Each model ran at its all-in-RAM setting and its top thinking level, with
+no limit on thinking or answer length. The task:
 
 > Design and create a very creative, elaborate, and detailed voxel art scene of a pagoda in a beautiful garden with
 > trees, including some cherry blossoms. Make the scene impressive and varied and use colorful voxels. Use whatever
 > libraries to get this done but make sure I can paste it all into a single HTML file and open it in Chrome.
+>
+> Save the finished page as pagoda.html in the current folder. To test it, run `check-page pagoda.html`: it opens the
+> page in headless Chrome (software graphics, no GPU), waits 15 seconds, and prints any errors and how much of the
+> screen is drawn. Keep testing and fixing until it works.
 
-![The five pages side by side](examples/pagoda/compare.gif)
+![The six pages side by side](examples/pagoda/compare.gif)
 
-| Model | Time | Tokens written | Opens as written? | After small fixes |
-| --- | ---: | ---: | --- | --- |
-| DeepSeek-V4.1-Flash | 940 s | 21,164 | Yes | not needed |
-| GLM-5.3-Flash | 703 s | 19,516 | No: a colour name and a helper it never defined | works after 2 one-line fixes |
-| Qwen3.8-Flash-Next | 492 s | 39,916 | No: a stray `±` sign in the code | runs after 6 fixes; its own fog hides most of the scene from its own camera |
-| Recursive Flint | 66 s | 12,377 | No: a sky object the library does not have | runs after 1 fix; its fog ends before the scene does |
-| Nemotron 3.5 Bolt | 109 s | 14,508 | No: a library address that does not exist, an undefined variable | still blank after 6 fixes |
+| Model | Time | Commands | Checker calls | The page |
+| --- | ---: | ---: | ---: | --- |
+| DeepSeek-V4.1-Flash | 6,574 s | 80 | 5 | Works: the most detailed scene |
+| GLM-5.3-Flash | 880 s | 13 | 3 | Works |
+| Nemotron 3.5 Bolt | 535 s | 17 | 6 | Works: a simple scene |
+| Qwen3.8-Flash-Next | 3,583 s | 102 | 9 | Builds the scene, but it comes out washed-out white |
+| Gyro-S (Qwen3.8-Flash-Next, all on the card) | 789 s | 6 | 2 | Empty: it builds 0 voxels |
+| Recursive Flint | 170 s | 15 | 3 | Blank: an error on load |
 
-- Thinking was capped at 8,192 tokens and the answer at 32,768. Qwen's first try used the whole answer and stopped
-  in the middle of its code (410 s); the table shows its second try, with 65,536.
-- The pages as the models wrote them are in [examples/pagoda/as-written](examples/pagoda/as-written), the fixed ones
-  in [examples/pagoda/fixed](examples/pagoda/fixed). The pictures come from Chrome without a graphics card, with the
-  same random seed for every page.
+- Every model stopped on its own with a saved page; none needed a nudge to go on. "Checker calls" counts the commands
+  that used `check-page`, including reading it.
+- The pages are in [examples/pagoda](examples/pagoda) as the models left them. The pictures come from Chrome on the
+  R9700 through ANGLE's OpenGL, with the same random seed for every page.
 
 ## DeepSeek-V4.1-Flash
 
@@ -304,17 +302,24 @@ rest in Q6_K (about 7 GB on the card).
   pictures (`<|begin_of_image|>` markers; the encoder gives GLM's picture tokens as one row, not a grid).
 
 **Leaving out light experts** (`STRATA_GLM_MISS_SKIP_W`, `STRATA_GLM_MISS_SKIP_FROM`): an expert that is not on the card
-and whose routing weight is under the setting is left out of that token instead of fetched from RAM or the SSD.
-Writing 400 tokens, all in RAM, against the unchanged model (the KL test above; two runs of it give 0.010):
+and whose routing weight is under the setting is left out of that token instead of fetched from RAM or the SSD. It is
+off in the configs here. Writing 400 tokens, all in RAM, against the unchanged model (the KL test above; two runs of it
+give 0.010):
 
 | Setting | Writing | Same next token | KL | Next-token loss |
 | --- | ---: | ---: | ---: | ---: |
-| off | 17.5 tok/s | 92% | 0.010 | 2.87 |
+| **off** (the tables above) | **17.5 tok/s** | 92% | 0.010 | 2.87 |
 | 0.12 from layer 23 | 22.0 | 85% | 0.020 | 2.92 |
 | 0.10 from layer 0 | 25.1 | 84% | 0.035 | 2.91 |
-| **0.12 from layer 0** (the tables above) | **28.2** | 85% | 0.048 | 2.94 |
+| 0.12 from layer 0 | 28.2 | 85% | 0.048 | 2.94 |
 | 0.16 from layer 0 | 31.7 | 73% | 0.177 | 3.08 |
 
+- **Why it is off:** each token changes little, but GLM thinks for thousands of tokens and the small changes add up.
+  On one Aider exercise (Go, poker) at thinking level high, GLM with all its experts in RAM and nothing left out
+  answered both tries in 6 minutes with about 5,500 tokens of thinking. Under a 32 GB cap with 0.12 from layer 0, its
+  second try thought for over 30 minutes and ran into the 32,000-token thinking limit. Replaying one Aider request
+  (Rust, acronym) at level max, one answer in two went into a loop under a 32 GB cap with 0.12 plus leaving out the
+  experts it would read from the SSD; none in six did with nothing left out.
 - **Why writing stops there:** every word reads all of GLM's always-used weights, about 6.9 GB (the attention layers in
   Q6_K), about 27 ms of the card's own work; the rest is experts copied from RAM. On this desktop the R9700 runs at
   PCIe 5.0 x8 (the second graphics card shares the processor's lanes), about 25 GB/s.
@@ -578,8 +583,7 @@ tokenizer is in the pack. The 48 GB and 32 GB setups add `"STRATA_GLM_RAM_GB": "
   "port": 8080,
   "backend": "hip",
   "env": {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16", "STRATA_GLM_SPLIT": "0",
-          "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "8192",
-          "STRATA_GLM_MISS_SKIP_W": "0.12", "STRATA_GLM_MISS_SKIP_FROM": "0"},
+          "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "8192"},
   "vision": {"exe": "<repo>/build-vision-glm/bin/strata-vision-hip", "mmproj": "<model dir>/vision/mmproj-GLM-5.3-Flash-F16.gguf",
              "model": "<model dir>/vision/GLM-5.3-Flash-vocab.gguf", "gpu": true}
 }
