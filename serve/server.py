@@ -3693,6 +3693,11 @@ class ByteTokenizer:
 
 
 # ------------------------------------------------------------------------------------------------ core
+def gptoss_tools(tools):
+    """gpt-oss's template reads OpenAI's {"type": "function", "function": {...}} for each tool; the server keeps them flat."""
+    return [t if isinstance(t, dict) and "function" in t else {"type": "function", "function": t} for t in tools] if tools else tools
+
+
 def gptoss_kwargs(kwargs: dict) -> dict:
     """gpt-oss's harmony template knows low / medium / high (its default medium), and thinking cannot be turned off
     (low instead)."""
@@ -4763,7 +4768,7 @@ class Service:
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         if MODEL_FAMILY == "gptoss":
-            return self.template.render(messages, tools=tools, **gptoss_kwargs(kwargs))
+            return self.template.render(messages, tools=gptoss_tools(tools), **gptoss_kwargs(kwargs))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -5037,7 +5042,7 @@ class Service:
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
             if MODEL_FAMILY == "gptoss":
-                kw = gptoss_kwargs(kw)
+                kw, marked_tools = gptoss_kwargs(kw), gptoss_tools(marked_tools)
             text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
