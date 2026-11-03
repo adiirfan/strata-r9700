@@ -105,6 +105,18 @@ def _sequence_findall(patterns, text: str, keep_empty: bool = True) -> list[str]
 # punctuation `[^\s\p{L}\p{N}]` without `\p{M}` (a combining mark joins the punctuation after it).  And llama.cpp sets
 # ignore_merges for glm4/glm5: a pre-token piece that is a whole vocabulary token is emitted as it is (no merges), only
 # the others go through BPE.
+# gpt-oss (o200k_harmony, GGUF pre "gpt-4o"): the original regex of its tokenizer.json, as llama.cpp's
+# LLAMA_VOCAB_PRE_TYPE_GPT4O quotes it (llama.cpp itself runs a rewrite without the Unicode case classes)
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 GLM_PATTERN = (
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
     r"|[^\r\n\p{L}\p{N}]?\p{L}+"
@@ -151,6 +163,9 @@ class Tokenizer:
                 self._split = self._re.findall
         elif self.ignore_merges:
             self._re = regex.compile(GLM_PATTERN)
+            self._split = self._re.findall
+        elif pre == "gpt-4o":
+            self._re = regex.compile(GPT4O_PATTERN)
             self._split = self._re.findall
         elif str(pre).startswith("deepseek"):
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
@@ -516,6 +531,9 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.pre == "gpt-4o":
+        cfg["pre_pattern"] = GPT4O_PATTERN
+        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_GPT4O, the original regex)"
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")

@@ -26,9 +26,11 @@ def main():
     ap.add_argument("out")
     ap.add_argument("routes", nargs="+")
     ap.add_argument("--experts", required=True)
-    ap.add_argument("--model", default="flint", choices=["flint", "ling"])
+    ap.add_argument("--model", default="flint", choices=["flint", "ling", "gptoss"])
     a = ap.parse_args()
     global EXPERTS, EXPERT_BYTES, TOPK
+    if a.model == "gptoss":   # 128 experts, top 4; MXFP4 2880 x 2880 x 3 (the engine's layout: 13,219,200 bytes)
+        EXPERTS, EXPERT_BYTES, TOPK = 128, 13219200, 4
     if a.model == "ling":   # 512 experts, top 8; Q4_0 gate / up (768 x 2560) and down - ~3.3 MB an expert
         EXPERTS, EXPERT_BYTES, TOPK = 512, 3 * 768 * 2560 * 18 // 32, 8
     total = {}
