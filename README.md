@@ -1,4 +1,4 @@
-# strata-r9700: DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Nemotron 3.5 Bolt and Recursive Flint on one Radeon AI PRO R9700
+# strata-r9700: DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, gpt-oss-120b, Nemotron 3.5 Bolt and Recursive Flint on one Radeon AI PRO R9700
 
 This is [Strata](https://github.com/Niko1221/Strata) 0.2.4 (commit `96ca4383`) tuned for a 32 GB Radeon AI PRO R9700,
 with four more models beside Strata's own. Every model works behind Strata's server, which offers OpenAI- and
@@ -12,6 +12,8 @@ Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.m
 - **GLM-5.3-Flash**: Project Maya's GLM engine (v1.1.28), built here as `engine/strata-glm` (`src/glm/`), with the
   server, the tokenizer and the picture encoder taught GLM's ways, and its prompt path made several times faster on
   this card.
+- **gpt-oss-120b**: a program of its own (`engine/strata-gptoss`, `src/gptoss/`), written for this card: the 61 GB of
+  experts split between the card and the processor, with the card's share following the conversation.
 - **Nemotron 3.5 Bolt, Recursive Flint and Ling-3.0-flash** are programs of their own. (This repo was `strata-nemo`,
   built on an older Strata. Nemotron, with and without its drafter, and Flint give the same output, token for token, on
   0.2.4 as before. Ling builds, but its model was not on hand for these measurements.)
@@ -23,6 +25,7 @@ Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.m
 | `engine/strata-r9700` | [Qwen3.8-Flash-Next](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) (SC117's abliterated GSQ-RCO IQ3_S) | 79 GB, of it 50 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `src/core/`, `src/prefill/`, `src/program/` |
 | `engine/strata-nemo` | [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB), with the [LiLiCorr drafter](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) | 24 GB | all on the card | 262,144 | `src/nemotron/` |
 | `engine/strata-flint` | [Recursive Flint 40B-A2.5B](https://huggingface.co/RecursiveSI/flint), [Q4_1 GGUF](https://huggingface.co/RecursiveSI/flint-int4-gguf) | 26 GB | all on the card | 262,144 | `src/flint/` |
+| `engine/strata-gptoss` | [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) | 63 GB, of it 61 GB of experts | card + RAM | 131,072 | `src/gptoss/`, `tools/gptoss/` |
 | `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + RAM | 131,072 | `src/ling/` |
 
 ## Results
@@ -354,6 +357,9 @@ context (a separate run from the tables above, same desktop):
   `STRATA_WARMUP_TOKENS` (one throwaway prompt before the server says it is ready).
 - **Output:** the FP8 and BF16 switches change the numbers. On the older Strata, 7 questions about a 20,000-token
   document answered greedily kept 6 answers word for word and reworded one summary.
+- **Route tail skip is off by default here** (`STRATA_ROUTE_TAIL_SKIP`; Strata 0.2.4 turns it on for this card): it
+  leaves out low-ranked experts the card lacks, which changes the answers. Every setting in this repo that changes the
+  output is opt-in. `STRATA_ROUTE_TAIL_SKIP=7` turns it back on.
 - **Left out** from strata-patches: the RTX 5080 laptop's low-RAM mode (0.2.4 has its own direct and overlapped reads)
   and the picture-detail ceiling.
 
@@ -415,6 +421,44 @@ program reads text only; the picture reader is not wired in.
 - **Conversation reuse:** the delta layers' running state cannot be rewound to an earlier token, so the engine saves
   it one token before the end of each prompt (`LING_SNAPS`, 4 kept). A turn that extends the last one goes on from
   where it stopped; otherwise from the latest saved state inside the shared part.
+
+## gpt-oss-120b
+
+OpenAI's gpt-oss-120b in its MXFP4 GGUF: 36 layers, 128 experts a layer and 4 used per token, attention with a learned
+"sink" per head, every other layer looking back only 128 tokens. Its 61 GB of experts do not fit the card, so
+`strata-gptoss` keeps about 23-26 GB of them on the card and the processor computes the rest from a copy in RAM, at the
+same time as the card computes its own. Weights keep their stored values: Q8_0 attention and output, MXFP4 experts.
+
+Measured on the desktop above, against llama.cpp (its ROCm build, flash attention, the best `--n-cpu-moe` that fits:
+20; 21, 22 and 24 were slower, fewer do not fit):
+
+| | llama.cpp | strata-gptoss |
+| --- | ---: | ---: |
+| Reading a 4,096-token prompt (tokens/s) | 1,548 | 2,884 |
+| Writing, continuing a document (tokens/s) | 31.4 | 68.6 |
+| Writing, a fresh chat question, 768 tokens (tokens/s) | 31.4 | 57.1 |
+| Perplexity, 4 x 4,096 tokens of llama.cpp's docs (the second half of each scored) | 3.8481 | 3.8522 |
+
+- **llama.cpp's figures** are `llama-bench` (pp4096, tg128) and `llama-perplexity` on the same text; Strata's are its
+  command line (`--ids`, `--new`, `GPTOSS_PPL=4096`). The two perplexities are within the measurement's own spread
+  (+-0.095), chunk by chunk going both ways.
+- **Accuracy,** against gpt-oss computed in 64-bit floats from the same GGUF (`tools/gptoss/ref_gptoss.py`, OpenAI's
+  reference YaRN): the layers' states agree to about 1e-4 of their size. The one place they parted, a router choice
+  between the 4th and 5th expert, was a near tie (logits 3e-5 apart).
+- **The card's experts follow the conversation** (as Ling's): each layer counts its routing, and an expert used more
+  than the layer's least-used one on the card takes its place, up to 2 after each written token and up to 32 a layer
+  for each prompt chunk. In the runs above, 75-89% of the chosen experts ended up on the card.
+- **The prompt path** runs on the matrix cores (16-bit products, each input split into two 16-bit halves) and copies
+  to the card only the experts it lacks. MXFP4 converts to 16-bit exactly on this checkpoint.
+- **Aider Polyglot** (60 exercises, reasoning "high", no thinking cap, through the server): 14 passed on the first
+  try, 40 after the second.
+- **Settings:** `GPTOSS_ADAPT=0` keeps the starting set, `GPTOSS_SWAPS` / `GPTOSS_SWAPS_PROMPT` the swaps, `GPTOSS_PLAN`
+  a fixed starting set (`tools/flint/make_plan.py --model gptoss` from `GPTOSS_ROUTE_DUMP` files), `GPTOSS_CHUNK` the
+  prompt chunk (4096), `GPTOSS_RESERVE_GB` the card memory left free (3), `GPTOSS_CPU_THREADS`.
+- **Server:** `"model_family": "gptoss"` reads its harmony format (the analysis channel is the thinking, a call to
+  `functions.NAME` a tool call); `reasoning_effort` low / medium / high (high: the top), and thinking cannot be turned
+  off (low instead). The tokenizer: `tools/strata_tokenizer.py --gguf MODEL.gguf --out DIR` (its `gpt-4o` pattern).
+- **Build:** `tools/r9700/build-gptoss.sh <ROCm 10 SDK dir>`. It needs about 62 GB of free RAM for the expert copy.
 
 ## Build
 
