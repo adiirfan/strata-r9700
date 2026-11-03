@@ -1450,21 +1450,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_host.resize((size_t) chunk);
         m.tok_up.init((size_t) chunk);
     }
-    bool pf_copy_made = false;
-#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
-    // STRATA_PF_COPY_PRIO=1 (opt-in): the expert copy stream at high priority, so it gets a hardware queue of its own (ROCm
-    // hands queues out per priority).  With GPU_MAX_HW_QUEUES=2 and the writing path's side streams it could share one with
-    // the prompt's compute stream, and then the copies stopped overlapping the products (the wait-copy phase of
-    // STRATA_PREFILL_TIMING grew by most of a 4K prompt's copy time).
-    {
-        static const bool cp = [] { const char* v = std::getenv("STRATA_PF_COPY_PRIO"); return v != nullptr && std::atoi(v) != 0; }();
-        int lo = 0, hi = 0;
-        if (cp && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
-            pf_copy_made = hipStreamCreateWithPriority(&m.copy, hipStreamNonBlocking, hi) == hipSuccess;
-        (void) cudaGetLastError();
-    }
-#endif
-    if (!pf_copy_made && cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
