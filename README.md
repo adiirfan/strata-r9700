@@ -57,19 +57,19 @@ own counts in tokens per second; first-token times are measured by the client.
 
 ### Strata's benchmark
 
-| Test | DeepSeek, 72 GB store | DeepSeek, 48 GB cap | DeepSeek, 32 GB cap | GLM, all in RAM | GLM, 48 GB cap | GLM, 32 GB cap | Qwen, all in RAM | Qwen, 32 GB cap | Qwen, 16 GB cap | Nemotron | Flint |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Chat: writing (tokens/s) | 17.9 | 15.3 | 12.0 | 17.4 | 7.9 | 6.2 | 78.3 | 60.1 | 40.9 | 124.4 | 238.0 |
-| Chat: first token | 2.67 s | 3.28 s | 4.05 s | 1.42 s | 3.30 s | 4.35 s | 0.49 s | 0.57 s | 0.89 s | 0.12 s | 0.07 s |
-| 4K prompt: reading (tokens/s) | 720 | 595 | 506 | 883 | 430 | 328 | 2,332 | 1,382 | 504 | 4,930 | 6,829 |
-| 4K prompt: first token | 5.73 s | 6.94 s | 8.15 s | 4.60 s | 9.44 s | 12.36 s | 1.75 s | 2.93 s | 7.99 s | 0.84 s | 0.60 s |
-| 16K prompt: reading (tokens/s) | 1,176 | 1,286 | 1,218 | 989 | 950 | 906 | 3,246 | 2,692 | 1,587 | 5,237 | 6,506 |
-| 16K prompt: first token | 14.11 s | 12.90 s | 13.61 s | 21.09 s | 17.04 s | 17.88 s | 4.98 s | 6.00 s | 10.15 s | 3.16 s | 2.54 s |
-| 32K prompt: reading (tokens/s) | 1,064 | 1,389 | 1,326 | 971 | 939 | 890 | 3,380 | 2,708 | 2,120 | 4,990 | 5,721 |
-| 32K prompt: first token | 31.18 s | 23.89 s | 25.01 s | 39.57 s | 34.27 s | 36.27 s | 9.52 s | 11.87 s | 15.16 s | 6.62 s | 5.76 s |
-| Agent session: prompt reused | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 68% |
-| Agent session: first token per turn | 9.89 s | 12.52 s | 15.01 s | 4.40 s | 9.32 s | 11.86 s | 1.60 s | 2.79 s | 7.55 s | 0.62 s | 0.46 s |
-| Agent session: writing (tokens/s) | 12.5 | 12.9 | 11.7 | 17.5 | 8.7 | 6.5 | 76.6 | 71.6 | 58.9 | 97.5 | 206.5 |
+| Test | DeepSeek, 72 GB store | DeepSeek, 48 GB cap | DeepSeek, 32 GB cap | GLM, all in RAM | GLM, 48 GB cap | GLM, 32 GB cap | Qwen, all in RAM | Qwen, 32 GB cap | Qwen, 16 GB cap | Nemotron | Flint | gpt-oss |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Chat: writing (tokens/s) | 17.9 | 15.3 | 12.0 | 17.4 | 7.9 | 6.2 | 82.7 | 73.5 | 57.7 | 124.4 | 238.0 | 56.1 |
+| Chat: first token | 2.67 s | 3.28 s | 4.05 s | 1.42 s | 3.30 s | 4.35 s | 0.45 s | 0.48 s | 0.67 s | 0.12 s | 0.07 s | 0.61 s |
+| 4K prompt: reading (tokens/s) | 720 | 595 | 506 | 883 | 430 | 328 | 2,630 | 2,385 | 642 | 4,930 | 6,829 | 2,309 |
+| 4K prompt: first token | 5.73 s | 6.94 s | 8.15 s | 4.60 s | 9.44 s | 12.36 s | 1.63 s | 1.95 s | 6.66 s | 0.84 s | 0.60 s | 1.81 s |
+| 16K prompt: reading (tokens/s) | 1,176 | 1,286 | 1,218 | 989 | 950 | 906 | 3,472 | 3,391 | 2,104 | 5,237 | 6,506 | 2,621 |
+| 16K prompt: first token | 14.11 s | 12.90 s | 13.61 s | 21.09 s | 17.04 s | 17.88 s | 4.73 s | 5.42 s | 8.71 s | 3.16 s | 2.54 s | 6.35 s |
+| 32K prompt: reading (tokens/s) | 1,064 | 1,389 | 1,326 | 971 | 939 | 890 | 3,526 | 3,544 | 2,692 | 4,990 | 5,721 | 2,256 |
+| 32K prompt: first token | 31.18 s | 23.89 s | 25.01 s | 39.57 s | 34.27 s | 36.27 s | 9.21 s | 10.61 s | 13.93 s | 6.62 s | 5.76 s | 14.65 s |
+| Agent session: prompt reused | 69% | 69% | 69% | 69% | 69% | 69% | 69% | 70% | 70% | 69% | 68% | 68% |
+| Agent session: first token per turn | 9.89 s | 12.52 s | 15.01 s | 4.40 s | 9.32 s | 11.86 s | 1.50 s | 1.81 s | 6.47 s | 0.62 s | 0.46 s | 1.52 s |
+| Agent session: writing (tokens/s) | 12.5 | 12.9 | 11.7 | 17.5 | 8.7 | 6.5 | 58.2 | 51.2 | 25.4 | 97.5 | 206.5 | 40.5 |
 
 - Nemotron's writing moves with how many of the drafter's guesses the model keeps (105-221 tokens/s over the chats).
 - The agent session reuses 69% of each turn's prompt from the conversation cache in every setup, so its first-token
@@ -149,37 +149,49 @@ Not measured. At this cap GLM writes about 6 tokens/s (Strata's benchmark above)
 
 | Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K (1,077) | 722 | 1.5 s | 80.3 | 84.1 |
-| 4K (4,121) | 2,521 | 1.7 s | 85.3 | 89.4 |
-| 16K (14,852) | 3,135 | 4.8 s | 82.5 | 83.1 |
-| 32K (30,625) | 3,348 | 9.2 s | 85.4 | 84.5 |
-| 64K (65,452) | 3,372 | 19.5 s | 76.1 | 76.7 |
-| 128K (125,056) | 3,217 | 39.0 s | 74.0 | 75.9 |
-| 256K (231,117) | 2,866 | 80.8 s | 67.6 | 69.6 |
+| 1K (1,077) | 810 | 1.4 s | 85.3 | 72.6 |
+| 4K (4,121) | 2,847 | 1.6 s | 86.2 | 87.8 |
+| 16K (14,852) | 3,408 | 4.5 s | 69.7 | 81.7 |
+| 32K (30,625) | 3,613 | 8.6 s | 64.2 | 87.0 |
+| 64K (65,453) | 3,218 | 20.5 s | 57.9 | 74.3 |
+| 128K (125,056) | 3,352 | 37.5 s | 55.8 | 80.5 |
+| 256K (231,117) | 3,082 | 75.3 s | 61.9 | 71.9 |
 
 #### Qwen, 32 GB cap
 
 | Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K (1,077) | 400 | 2.7 s | 67.9 | 74.1 |
-| 4K (4,120) | 1,426 | 2.9 s | 76.9 | 80.4 |
-| 16K (14,852) | 2,545 | 5.9 s | 76.6 | 78.5 |
-| 32K (30,625) | 2,604 | 11.8 s | 80.2 | 81.0 |
-| 64K (65,453) | 2,895 | 22.7 s | 74.4 | 74.2 |
-| 128K (125,056) | 2,890 | 43.4 s | 71.7 | 69.9 |
-| 256K (231,117) | 2,555 | 90.6 s | 67.4 | 65.9 |
+| 1K (1,077) | 557 | 2.3 s | 65.7 | 76.8 |
+| 4K (4,120) | 2,141 | 2.0 s | 80.8 | 84.9 |
+| 16K (14,852) | 3,332 | 4.5 s | 47.7 | 79.4 |
+| 32K (30,625) | 3,538 | 8.7 s | 35.1 | 59.3 |
+| 64K (65,453) | 3,537 | 18.6 s | 33.3 | 61.0 |
+| 128K (125,056) | 3,470 | 36.1 s | 35.1 | 55.0 |
+| 256K (231,117) | 3,149 | 73.6 s | 33.8 | 51.1 |
 
 #### Qwen, 16 GB cap
 
 | Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K (1,077) | 147 | 7.3 s | 52.3 | 55.9 |
-| 4K (4,121) | 528 | 7.8 s | 70.4 | 55.9 |
-| 16K (14,852) | 1,496 | 10.0 s | 59.2 | 63.2 |
-| 32K (30,625) | 2,019 | 15.3 s | 67.5 | 67.4 |
-| 64K (65,453) | 2,266 | 29.0 s | 57.6 | 58.1 |
-| 128K (125,055) | 2,261 | 55.4 s | 59.2 | 56.6 |
-| 256K (231,116) | 2,017 | 114.8 s | 58.9 | 58.1 |
+| 1K (1,077) | 165 | 7.1 s | 47.4 | 57.7 |
+| 4K (4,121) | 611 | 6.8 s | 60.5 | 65.1 |
+| 16K (14,852) | 1,903 | 7.8 s | 36.6 | 61.6 |
+| 32K (30,625) | 2,635 | 11.7 s | 26.2 | 51.7 |
+| 64K (65,453) | 2,737 | 24.0 s | 27.3 | 45.6 |
+| 128K (125,056) | 2,614 | 48.0 s | 31.2 | 44.2 |
+| 256K (231,117) | 2,366 | 97.9 s | 30.3 | 42.5 |
+
+#### gpt-oss
+
+| Prompt | Reading (tokens/s) | First token | Writing 128 (tokens/s) | Writing 1,024 (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K (1,058) | 739 | 1.5 s | 43.9 | 61.1 |
+| 4K (4,129) | 2,038 | 2.1 s | 44.0 | 55.1 |
+| 16K (14,597) | 2,399 | 6.2 s | 35.3 | 44.3 |
+| 32K (30,265) | 2,139 | 14.3 s | 27.8 | 34.0 |
+| 64K (62,786) | 1,792 | 35.3 s | 20.2 | 21.4 |
+
+(128K and up do not fit its 131,072-token context with room for the answer.)
 
 #### Nemotron
 
@@ -357,6 +369,15 @@ context (a separate run from the tables above, same desktop):
   `STRATA_WARMUP_TOKENS` (one throwaway prompt before the server says it is ready).
 - **Output:** the FP8 and BF16 switches change the numbers. On the older Strata, 7 questions about a 20,000-token
   document answered greedily kept 6 answers word for word and reworded one summary.
+- **Measured again 2026-11-03** with the faster writing (fewer launches and host waits per layer) and
+  `GPU_MAX_HW_QUEUES=2`, in the tables above. Against the same day's run of the previous engine, all in RAM: chat
+  writing 79.2 -> 82-88 tokens/s, prompt reading the same or better. Writing right after a long prompt starts slower
+  than in the October tables (the card's experts are still coming back), but the previous engine measured the same
+  that day (32 GB cap, 32K prompt, first 128 tokens: 28.7 tokens/s, this engine 34.1), so that difference is the run,
+  not the code.
+- **Left off on purpose:** `STRATA_SH_STREAM=1` and `STRATA_SIDE_MIXER=2` add writing speed but, with two hardware
+  queues, sometimes put the draft layer's prompt work in front of the expert copies: a 4K prompt then takes about 0.8 s
+  longer. The English-only draft vocabulary (`--mtp-draft-vocab data/draft_vocab_en.bin`) was no faster in agent use.
 - **Route tail skip is off by default here** (`STRATA_ROUTE_TAIL_SKIP`; Strata 0.2.4 turns it on for this card): it
   leaves out low-ranked experts the card lacks, which changes the answers. Every setting in this repo that changes the
   output is opt-in. `STRATA_ROUTE_TAIL_SKIP=7` turns it back on.
@@ -452,6 +473,9 @@ Measured on the desktop above, against llama.cpp (its ROCm build, flash attentio
   to the card only the experts it lacks. MXFP4 converts to 16-bit exactly on this checkpoint.
 - **Aider Polyglot** (60 exercises, reasoning "high", no thinking cap, through the server): 14 passed on the first
   try, 40 after the second.
+- **In the benchmark tables** gpt-oss runs at its lowest reasoning level (the suite asks for thinking off, which
+  gpt-oss does not have), with a 131,072-token context. Writing slows with length faster than the other engines':
+  its full-attention layers read the history with a simple kernel that has not been tuned yet.
 - **Settings:** `GPTOSS_ADAPT=0` keeps the starting set, `GPTOSS_SWAPS` / `GPTOSS_SWAPS_PROMPT` the swaps, `GPTOSS_PLAN`
   a fixed starting set (`tools/flint/make_plan.py --model gptoss` from `GPTOSS_ROUTE_DUMP` files), `GPTOSS_CHUNK` the
   prompt chunk (4096), `GPTOSS_RESERVE_GB` the card memory left free (3), `GPTOSS_CPU_THREADS`.
@@ -650,7 +674,7 @@ setup above:
   "env": {"STRATA_HIPBLASLT_TUNING": "tools/hip/gfx1201-hipblaslt-100500.txt", "STRATA_HIP_WMMA": "1",
           "STRATA_SELECT_WMMA": "1", "STRATA_PF_FUSED": "1", "STRATA_ROUTE_RESIDENT": "1", "STRATA_UNBUFFERED_LOAD": "1",
           "HSA_USERPTR_FOR_PAGED_MEM": "0", "STRATA_PF_FP8": "1", "STRATA_PF_FUSED_F8": "1", "STRATA_PF_DM16": "1",
-          "STRATA_REFILL_ASYNC": "1", "STRATA_WARMUP_TOKENS": "4096"}
+          "STRATA_REFILL_ASYNC": "1", "STRATA_WARMUP_TOKENS": "4096", "GPU_MAX_HW_QUEUES": "2"}
 }
 ```
 
