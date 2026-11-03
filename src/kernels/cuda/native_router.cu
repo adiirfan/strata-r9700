@@ -96,13 +96,9 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
-__launch_bounds__(256, 1)
-__global__ void route_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
-                            float* __restrict__ weights, int n_tok) {
-    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
-    if (tk >= n_tok) return;
-    logits += (size_t) tk * 512; ids += (size_t) tk * 10; weights += (size_t) tk * 10;
-    const int lane = threadIdx.x;
+// one token's top-10 (route_multi's body; the fused chain below runs the same code)
+__device__ __forceinline__ void route10_token(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                                              float* __restrict__ weights, const int lane) {
     float values[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
@@ -147,6 +143,13 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
+__launch_bounds__(256, 1)
+__global__ void route_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                            float* __restrict__ weights, int n_tok) {
+    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+    if (tk >= n_tok) return;
+    route10_token(logits + (size_t) tk * 512, ids + (size_t) tk * 10, weights + (size_t) tk * 10, (int) threadIdx.x);
 }
 // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
 // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
@@ -262,12 +265,10 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 // (a swap changes the set already picked), but the scan is coalesced (lane j reads f = j, j + 32, ...) and reduced
 // within the warp.  The bits are unchanged: a strictly greater logit wins, the smallest expert index breaks ties,
 // and the softmax is the same expression.
-__global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
-                                 const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
-                                 unsigned long long* __restrict__ stats) {
-    const int t = blockIdx.x;
-    if (t >= n_tok) return;
-    const int lane = (int) threadIdx.x;
+__device__ __forceinline__ void route_resident_token(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                                                     float* __restrict__ weights, const int32_t* __restrict__ res,
+                                                     float margin, int lo, int hi, unsigned long long* __restrict__ stats,
+                                                     const int t, const int lane) {
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     int32_t my[10];
@@ -317,6 +318,56 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             atomicAdd(stats + 3, (unsigned long long) after);
         }
     }
+}
+__global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                 const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
+                                 unsigned long long* __restrict__ stats) {
+    const int t = blockIdx.x;
+    if (t >= n_tok) return;
+    route_resident_token(logits, ids, weights, res, margin, lo, hi, stats, t, (int) threadIdx.x);
+}
+// qwen-decode: the router's top-10, the residency re-pick (when margin > 0) and the doorbell publish of
+// doorbell_publish_res_kernel in ONE launch for a window of up to 8 tokens (one warp a token, then the block); each
+// part is the code of its own kernel, so every value is the same as the three launches
+__launch_bounds__(256, 1)
+__global__ void route_chain_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                              int n_tok, const int32_t* __restrict__ res, float margin, int lo, int hi,
+                              unsigned long long* __restrict__ stats, const float* __restrict__ x, int nx, float* x_out,
+                              int32_t* ids_out, uint32_t* seq) {
+    const int w = (int) threadIdx.y, lane = (int) threadIdx.x, tid = w * 32 + lane;
+    if (w < n_tok) route10_token(logits + (size_t) w * 512, ids + (size_t) w * 10, weights + (size_t) w * 10, lane);
+    __syncthreads();
+    if (margin > 0.0f && w < n_tok) route_resident_token(logits, ids, weights, res, margin, lo, hi, stats, w, lane);
+    __syncthreads();
+    const int k = n_tok * 10;
+    int any_miss = 0;
+    if (tid < k) {
+        const int32_t id = ids[tid];
+        ids_out[tid] = id;
+        if (res == nullptr || id < 0 || id >= 512 || res[id] < 0) any_miss = 1;
+    }
+    if (__syncthreads_or(any_miss)) {
+        for (int i = tid; i < nx; i += 256) x_out[i] = x[i];
+        __threadfence_system();
+    } else if (tid < k) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (tid == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)
+        __threadfence_system();
+#endif
+    }
+}
+void native_route_chain(const float* logits, int32_t* ids, float* weights, int n_tok, const int32_t* res_layer,
+                        float margin, int rank_lo, int rank_hi, unsigned long long* stats, const float* x, int64_t nx,
+                        float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+    if (!stream || n_tok < 1 || n_tok > 8) throw std::invalid_argument("native_route_chain: 1-8 tokens and a stream");
+    route_chain_k<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, n_tok, res_layer, margin, rank_lo, rank_hi, stats, x, (int) nx, x_out, ids_out, d_seq);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {

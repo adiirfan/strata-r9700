@@ -1085,6 +1085,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
+    if (pf_s_ == nullptr && std::getenv("STRATA_LAYER_PF") != nullptr && std::atoi(std::getenv("STRATA_LAYER_PF")) > 0) {   // qwen-decode
+        if (cudaStreamCreateWithFlags(&pf_s_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&pf_ev_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaMalloc((void**) &pf_sink_, sizeof(unsigned)) != cudaSuccess) { cudaGetLastError(); pf_s_ = nullptr; }
+    }
+    if (wfr_done_ == nullptr &&   // qwen-decode STRATA_PCIE_CHAIN's counter (allocated here: never during a capture)
+        (cudaMalloc((void**) &wfr_done_, 2 * sizeof(unsigned int)) != cudaSuccess ||
+         cudaMemset(wfr_done_, 0, 2 * sizeof(unsigned int)) != cudaSuccess)) { cudaGetLastError(); wfr_done_ = nullptr; }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
@@ -1143,6 +1152,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto lfuse_on = [&](int n) {
         return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
                shared_expert_native_bf16_enabled();
+    };
+    // qwen-decode STRATA_LFUSE_NR (default on; 0: off): the same gate deferral on the path with a host plan, where the
+    // combine adds the GPU's hit rows (STRATA_FUSE_HITS) - its gated form applies the gate (sigmoid_scale_rows' bits)
+    static const bool lfuse_nr_env = [] { const char* e = std::getenv("STRATA_LFUSE_NR"); return !e || e[0] != '0'; }();
+    auto lfuse_nr_on = [&](int n, int tb) {
+        return lfuse_nr_env && !ar_on() && !prof_on_ && !remote_opt_ && fuse_hits_on() && native_moe_combine_enabled() &&
+               dec_batch && n > 1 && n <= 8 && shared_expert_native_bf16_enabled() &&
+               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n) &&
+               (((uintptr_t) (hit_out_ + (size_t) tb * K * N)) & 15u) == 0;
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     if (!batch_rec_) groups_[T] = G;
@@ -1231,8 +1249,55 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
+    // qwen-decode STRATA_LAYER_PF=<blocks> (opt-in; STRATA_LAYER_PF_ALL=1 adds the big projections): as layer l starts,
+    // layer l + 1's fixed weights (hyper-connection projections, the small GDN / QSA projections, the router and the
+    // shared expert) are read on a side stream into the card's memory-side cache, where the main stream then finds them
+    static const int lpf_blocks = [] { const char* e = std::getenv("STRATA_LAYER_PF"); return e ? std::atoi(e) : 0; }();
+    static const bool lpf_all = [] { const char* e = std::getenv("STRATA_LAYER_PF_ALL"); return e && e[0] == '1'; }();
+    bool lpf_forked = false;
+    auto native_bytes = [](const WeightRef* w) -> uint64_t {
+        if (w == nullptr || w->native_data == nullptr) return 0;
+        int qk = 0, bb = 0;
+        switch (w->native_type) {
+            case 2: qk = 32; bb = 18; break;  case 6: qk = 32; bb = 22; break;  case 8: qk = 32; bb = 34; break;
+            case 20: qk = 32; bb = 18; break; case 11: qk = 256; bb = 110; break; case 12: qk = 256; bb = 144; break;
+            case 13: qk = 256; bb = 176; break; case 14: qk = 256; bb = 210; break; case 23: qk = 256; bb = 136; break;
+            default: return 0;
+        }
+        return (uint64_t) w->ne1 * (uint64_t) (w->ne0 / qk) * (uint64_t) bb;
+    };
+    auto layer_prefetch = [&](int64_t m) {
+        if (lpf_blocks <= 0 || pf_s_ == nullptr || m >= le_ || batch_rec_ || prof_on_) return;
+        const LayerView pv(wt, m);
+        std::vector<const void*> ptr;
+        std::vector<uint64_t> by;
+        auto add_data = [&](const char* suffix) { if (const WeightRef* w = pv.get(suffix)) { ptr.push_back(w->data); by.push_back(w->bytes); } };
+        auto add_native = [&](const char* suffix) { if (const WeightRef* w = pv.get(suffix)) { ptr.push_back(w->native_data); by.push_back(native_bytes(w)); } };
+        auto add_hc = [&](const char* suffix) {
+            if (const WeightRef* w = pv.get(suffix)) { ptr.push_back(w->hc_q8); by.push_back(w->hc_q8 ? (uint64_t) w->elements / 32 * 34 : 0); }
+        };
+        for (const char* h : {"hc_attn_", "hc_ffn_"}) {
+            const std::string b(h);
+            add_hc((b + "down.weight").c_str()); add_hc((b + "up.weight").c_str());
+            add_data((b + "norm.weight").c_str()); add_data((b + "inject.weight").c_str());
+        }
+        if (!is_qsa_layer(g, m)) {
+            add_native("attn_gate.weight"); add_data("ssm_alpha.weight"); add_data("ssm_beta.weight"); add_data("ssm_conv1d.weight");
+            if (lpf_all) { add_native("attn_qkv.weight"); add_native("ssm_out.weight"); }
+        } else {
+            add_native("attn_k.weight"); add_native("attn_v.weight"); add_data("indexer.k_proj.weight"); add_data("indexer.q_proj.weight");
+            if (lpf_all) { add_native("attn_q.weight"); add_native("attn_output.weight"); }
+        }
+        add_data("ffn_gate_inp.weight"); add_data("ffn_gate_inp_shexp.weight");
+        add_native("ffn_gate_shexp.weight"); add_native("ffn_up_shexp.weight"); add_native("ffn_down_shexp.weight");
+        cudaEventRecord(pf_ev_, cs);
+        cudaStreamWaitEvent(pf_s_, pf_ev_, 0);
+        strata::kernels::touch_buffers(ptr.data(), by.data(), (int) ptr.size(), lpf_blocks, pf_sink_, pf_s_);
+        lpf_forked = true;
+    };
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
+        if (grp == 0) layer_prefetch(l + 1);
         stamp(l, 0, grp);
         const LayerView v(wt, l);
         const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
@@ -1460,7 +1525,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                // qwen-decode: q/k/v and the gate projection z in one grouped launch (z is read only after the
+                // recurrence; bitwise the two calls - STRATA_MMVQ_GROUP=0: the two calls, z after the gates)
+                bool z_done = false;
+                if (!side_proj && !br && n >= 2 &&
+                    !(g_mmvq_il() && (strata::kernels::native_mmvq_il_supported(wqkv->native_type, n, (int) C) ||
+                                      strata::kernels::native_mmvq_il_supported(wg->native_type, n, (int) ZV)))) {
+                    const strata::kernels::MmvqGroupMember gm[2] = {
+                        {wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C, (int) C},
+                        {wg->native_type, wg->native_data, z_ + (size_t) tb * ZV, (int) ZV}};
+                    z_done = strata::kernels::native_mmvq_group(gm, 2, xq_, (int) N, n, cs);
+                }
+                if (!side_proj && !z_done) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1493,7 +1569,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj && !z_done) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -1938,8 +2014,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
-        const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+        const bool lfuse_nr = lfuse_nr_on(n, tb);
+        const WeightRef* w_sgi = (lfuse_on(n) || lfuse_nr) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        // qwen-decode STRATA_ROUTE_CHAIN (default on; 0: the three launches): the top-10, the residency re-pick and
+        // the doorbell publish as one launch - only where the three would run as here (all bitwise the same)
+        static const bool route_chain_env = [] { const char* e = std::getenv("STRATA_ROUTE_CHAIN"); return !e || e[0] != '0'; }();
+        static const float route_prior_c = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+#if defined(STRATA_USE_HIP)
+        const bool db_store = g_doorbell_store;
+#else
+        const bool db_store = false;
+#endif
+        const bool route_chain = route_chain_env && dec_batch && n > 1 && n <= 8 && w_router != nullptr &&
+                                 native_router_enabled() && NE == 512 && K == 10 && !(route_prior_c > 0.0f) &&
+                                 !(rs_on_ && G == 1 && n <= 8 && T <= 8) && !ar_on() && !device_plan_ && !db_store &&
+                                 !remote_opt_ && !always_publish_ && hits_.d_res != nullptr;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -1949,7 +2039,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
-                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                if (!route_chain) native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {
@@ -1971,7 +2061,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if (route_chain) {
+            try {
+                native_route_chain(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, hits_.d_res + l * g.n_expert,
+                                   route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
+                                   rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, xm, (int64_t) n * N,
+                                   m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+            } catch (const std::exception& e) { err = "verify route chain: " + std::string(e.what()); return false; }
+        }
+        if (!route_chain && route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
@@ -2002,7 +2100,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
+            else if (!route_chain) {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
@@ -2039,7 +2137,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                                    (sg_ready ? 1 : 0) | ((lfuse_on(n) || lfuse_nr) && g_lfuse_pair() ? 2 : 0));
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
@@ -2104,6 +2202,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        bool combine_mapped = false;   // qwen-decode STRATA_COMBINE_MAPPED took effect (set with the CPU share below)
         if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
@@ -2126,6 +2225,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
+            // qwen-decode STRATA_NO_PCIE_GROUP=1 (generate.cpp forces pcie_frac 0 with it): the plan never has a PCIe share,
+            // so its wait, staging copy, re-pointing and grouped experts are left out of the window
+            static const bool no_pcie = [] { const char* e = std::getenv("STRATA_NO_PCIE_GROUP"); return e && e[0] == '1'; }();
+            const bool skip_pcie = no_pcie && m_bal_ == nullptr && !remote_opt_;
+            // qwen-decode STRATA_PCIE_CHAIN=1 (opt-in): the wait, the staging copy and the re-pointing in one launch
+            static const bool pcie_chain_env = [] { const char* e = std::getenv("STRATA_PCIE_CHAIN"); return e && e[0] == '1'; }();   // measured neutral on the R9700: opt-in
+            const bool pcie_chain = pcie_chain_env && !device_plan_ && m_bal_ == nullptr && sink_.pcie_mode == 2 && wfr_done_ != nullptr;
+            if (skip_pcie) {
+            } else if (pcie_chain) {
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                wait_fetch_rebase(m_flagB_, ring, (unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l),
+                                  wfr_done_, cs);
+            } else {
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
@@ -2136,10 +2249,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
             }
+            }
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            if (!skip_pcie) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
@@ -2147,6 +2261,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                          skip_ + grp, ring, cs);
             } else {
                 const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;   // 143-amdk
+                // qwen-decode STRATA_COMBINE_MAPPED (default on; 0: off): the copy of the CPU's rows and the hits-added
+                // combine as one launch (needs the combine that adds the hits: the same test as hits_in_combine below)
+                static const bool cm_env = [] { const char* e = std::getenv("STRATA_COMBINE_MAPPED"); return !e || e[0] != '0'; }();
+                combine_mapped = cm_env && fuse_rows && fuse_hits_on() && (!sg_gated_[grp] || !ar_on()) && n > 1 &&
+                                 native_moe_combine_enabled() && n <= 8 &&
+                                 native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n) &&
+                                 (((uintptr_t) (m_ymiss_ + (size_t) tb * K * N)) & 15u) == 0 && (((uintptr_t) hit_out) & 15u) == 0;
                 if (!fuse_rows) {
                     if (m_bal_ != nullptr)   // set_pcie_balance: ... and ends as it waits for the CPU's rows
                         wait_flag_ge_stamped(m_flag_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 2, nullptr, cs);
@@ -2156,6 +2277,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
+                else if (fuse_rows && combine_mapped) {}   // qwen-decode: the combine below reads the CPU's rows itself
                 else if (fuse_rows)   // the wait folded into the copy's blocks
                     copy_rows_from_mapped_after(m_flag_, ring, parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                                 p_dst, p_counts + 1, cs);
@@ -2166,7 +2288,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && (!sg_gated_[grp] || !ar_on()) && dec_batch && n > 1 &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
@@ -2176,6 +2298,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
+        if (combine_mapped) {   // qwen-decode: copy_rows_from_mapped_after + the hits-added combine (gated or not)
+            if (!hits_in_combine) { err = "verify combine: the mapped combine needs the hits-added combine"; return false; }
+            try {
+                native_moe_combine_multi_mapped(m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                                shared_ + tb * N, sg_gated_[grp] ? sh_g_ + tb : nullptr, bo_ + tb * N, N, K, n,
+                                                m_flag_, ring, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
+        if (sg_gated_[grp] && !ar_on()) {   // STRATA_LFUSE_NR: the hits-added combine applies the gate
+            if (!hits_in_combine) { err = "verify combine: a deferred shared gate needs the hits-added combine"; return false; }
+            try {
+                native_moe_combine_multi_hits_added_gated(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                                          shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
@@ -2234,6 +2371,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
+    if (lpf_forked) {   // STRATA_LAYER_PF: the side stream rejoins before the window's end (a capture must close every fork)
+        cudaEventRecord(pf_join_, pf_s_);
+        cudaStreamWaitEvent(cs, pf_join_, 0);
+    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag

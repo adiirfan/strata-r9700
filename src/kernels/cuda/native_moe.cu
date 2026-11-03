@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/dp4a.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -95,10 +96,13 @@ __global__ void combine_k10_vec4(const float4* __restrict__ parts4, const float*
     sum.w += sh.w;
     output4[c4] = sum;
 }
+// qwen-decode GATED (STRATA_LFUSE_NR): `shared` is the shared expert's unscaled output and sg its raw gate logit per
+// token; the row is scaled as sigmoid_scale_rows_vec4_kernel does (its expression, one rounded multiply), then added
+template<bool GATED = false>
 __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const float4* __restrict__ hits4,
                                       const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
                                       const float* __restrict__ weights, const float4* __restrict__ shared4,
-                                      float4* __restrict__ output4, int64_t n4) {
+                                      float4* __restrict__ output4, int64_t n4, const float* __restrict__ sg = nullptr) {
     const int64_t tk = blockIdx.y;
     __shared__ int hit_mask;
     if (threadIdx.x == 0) hit_mask = 0;
@@ -131,7 +135,81 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
         sum.z = fmaf(p.z, w, sum.z);
         sum.w = fmaf(p.w, w, sum.w);
     }
-    const float4 sh = shared4[c4];
+    float4 sh = shared4[c4];
+    if constexpr (GATED) {
+#pragma clang fp contract(off)
+        const float gt = __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk)));
+        sh.x *= gt;
+        sh.y *= gt;
+        sh.z *= gt;
+        sh.w *= gt;
+    }
+    sum.x += sh.x;
+    sum.y += sh.y;
+    sum.z += sh.z;
+    sum.w += sh.w;
+    output4[c4] = sum;
+}
+// qwen-decode STRATA_COMBINE_MAPPED: copy_rows_from_mapped_kernel (its flag wait, then the CPU's rows from mapped memory
+// and zeros for the GPU's own) and combine_k10_vec4_hits in one launch: a row is the CPU's value from `ymiss`, or
+// 0.0f + the GPU's hit row - the same values the copy and the combine produce
+template<bool GATED>
+__global__ void combine_k10_vec4_mapped(const volatile float4* ymiss4, const float4* __restrict__ hits4,
+                                        const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                        const float* __restrict__ weights, const float4* __restrict__ shared4,
+                                        float4* __restrict__ output4, int64_t n4, const float* __restrict__ sg,
+                                        const volatile uint32_t* wait_flag, uint32_t wait_value) {
+    const int64_t tk = blockIdx.y;
+    __shared__ int hit_mask;
+    if (threadIdx.x == 0) {
+        while (*wait_flag < wait_value) strata_spin_pause();
+        __threadfence_system();
+        hit_mask = 0;
+    }
+    __syncthreads();
+    const int nh = *count;
+    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
+        const int r = dst[h];
+        if (r / 10 == (int) tk) atomicOr(&hit_mask, 1 << (r % 10));
+    }
+    __syncthreads();
+    const int mask = hit_mask;
+    ymiss4 += tk * 10 * n4;
+    hits4 += tk * 10 * n4;
+    weights += tk * 10;
+    shared4 += tk * n4;
+    output4 += tk * n4;
+    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c4 >= n4) return;
+    const float w0 = __ldg(weights + 0);
+    float4 p0;
+    if (mask & 1) { const float4 hh = hits4[c4]; p0 = make_float4(0.0f + hh.x, 0.0f + hh.y, 0.0f + hh.z, 0.0f + hh.w); }
+    else p0 = const_cast<const float4*>(ymiss4)[c4];
+    float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
+#pragma unroll
+    for (int expert = 1; expert < 10; ++expert) {
+        const float w = __ldg(weights + expert);
+        float4 p;
+        if ((mask >> expert) & 1) {
+            const float4 hh = hits4[int64_t(expert) * n4 + c4];
+            p = make_float4(0.0f + hh.x, 0.0f + hh.y, 0.0f + hh.z, 0.0f + hh.w);
+        } else {
+            p = const_cast<const float4*>(ymiss4)[int64_t(expert) * n4 + c4];
+        }
+        sum.x = fmaf(p.x, w, sum.x);
+        sum.y = fmaf(p.y, w, sum.y);
+        sum.z = fmaf(p.z, w, sum.z);
+        sum.w = fmaf(p.w, w, sum.w);
+    }
+    float4 sh = shared4[c4];
+    if constexpr (GATED) {
+#pragma clang fp contract(off)
+        const float gt = __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk)));
+        sh.x *= gt;
+        sh.y *= gt;
+        sh.z *= gt;
+        sh.w *= gt;
+    }
     sum.x += sh.x;
     sum.y += sh.y;
     sum.z += sh.z;
@@ -184,9 +262,42 @@ void native_moe_combine_multi_hits_added(const float* parts, const float* hits, 
     if (!stream || !native_moe_combine_hits_supported(parts, shared, output, n_embd, k, n_tok) || ((uintptr_t) hits & 15u) != 0)
         throw std::invalid_argument("native MoE combine (hits added) requires k = 10, aligned spans, 1..8 tokens");
     const int64_t n4 = n_embd >> 2;
-    combine_k10_vec4_hits<<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+    combine_k10_vec4_hits<false><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const float4*>(parts), reinterpret_cast<const float4*>(hits), dst, count, weights,
         reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_hits_added_gated(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                               const float* weights, const float* shared, const float* shared_gate, float* output,
+                                               int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || !shared_gate || !native_moe_combine_hits_supported(parts, shared, output, n_embd, k, n_tok) || ((uintptr_t) hits & 15u) != 0)
+        throw std::invalid_argument("native MoE combine (hits added, gated) requires k = 10, aligned spans, 1..8 tokens");
+    const int64_t n4 = n_embd >> 2;
+    combine_k10_vec4_hits<true><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const float4*>(parts), reinterpret_cast<const float4*>(hits), dst, count, weights,
+        reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4, shared_gate);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_mapped(const float* ymiss, const float* hits, const int32_t* dst, const int32_t* count,
+                                     const float* weights, const float* shared, const float* shared_gate, float* output,
+                                     int64_t n_embd, int64_t k, int n_tok, const uint32_t* wait_flag, uint32_t wait_value,
+                                     void* stream) {
+    if (!stream || !wait_flag || !native_moe_combine_hits_supported(ymiss, shared, output, n_embd, k, n_tok) || ((uintptr_t) hits & 15u) != 0)
+        throw std::invalid_argument("native MoE combine (mapped) requires k = 10, aligned spans, 1..8 tokens and a flag");
+    const int64_t n4 = n_embd >> 2;
+    const dim3 grid(unsigned((n4 + 127) / 128), (unsigned) n_tok);
+    if (shared_gate != nullptr)
+        combine_k10_vec4_mapped<true><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            reinterpret_cast<const volatile float4*>(ymiss), reinterpret_cast<const float4*>(hits), dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4, shared_gate,
+            (const volatile uint32_t*) wait_flag, wait_value);
+    else
+        combine_k10_vec4_mapped<false><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            reinterpret_cast<const volatile float4*>(ymiss), reinterpret_cast<const float4*>(hits), dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4, nullptr,
+            (const volatile uint32_t*) wait_flag, wait_value);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

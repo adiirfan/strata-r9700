@@ -3922,6 +3922,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
+    // qwen-decode STRATA_NO_PCIE_GROUP=1 (opt-in): no PCIe share at all - the misses all go to the CPU pool - so the verify
+    // window can leave out the PCIe group's launches (Verifier::post); the share is forced to 0 and never refined
+    if (const char* np = std::getenv("STRATA_NO_PCIE_GROUP"); np != nullptr && np[0] == '1') {
+        o.pcie_frac = 0.0;
+        o.pcie_frac_auto = false;
+        std::fprintf(stderr, "strata generate: STRATA_NO_PCIE_GROUP=1: pcie_frac 0, the verify window has no PCIe group\n");
+    }
     // STRATA_PCIE_BALANCE=1 (opt-in): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
     // instead of the probe's fixed share above - the CPU's speed sets the right share as much as the link's.  IQ2_XS,
     // one AVX2 pool worker (emulated on an RTX 5090 + 9950X3D): 16.8-17.2 -> 12.8-13.0 ms a round; the 9950X3D's own

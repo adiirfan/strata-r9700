@@ -135,6 +135,14 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 /// Plan v0.3 P6: copy *n (device memory) blobs of `blob_bytes` from mapped host memory (src[k], device aliases)
 /// into dst + k * blob_bytes with coalesced 16-byte loads - the PCIe share of a layer's missed experts, staged
 /// into VRAM before the grouped expert kernel reads them.  Launched for a capacity of `cap` blobs.
+// qwen-decode STRATA_LAYER_PF: read up to kTouchMax buffers (16-byte aligned, values unused) so they sit in the card's
+// memory-side cache when the main stream reaches them; `blocks` 256-thread blocks; `sink` one device word
+constexpr int kTouchMax = 24;
+void touch_buffers(const void* const* ptrs, const uint64_t* bytes, int n, int blocks, unsigned* sink, void* stream);
+// qwen-decode STRATA_PCIE_CHAIN: wait_flag_ge(flag, value) + fetch_blobs(ptr, n, dst, ...) + rebase_ptrs(ptr, n, dst, ...)
+// in one launch (`done`: two device words, 0 before the first launch, left at 0)
+void wait_fetch_rebase(const uint32_t* flag, uint32_t value, unsigned long long* ptr, const int32_t* n, uint8_t* dst,
+                       int64_t blob_bytes, unsigned int* done, void* stream);
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream);
 /// table[pairs[2k]] = pairs[2k + 1] for k < n, `pairs` in mapped host memory: a residency table's changed entries,
 /// stream-ordered before the window that reads it, without the copy engine (where the tier's swaps may queue).

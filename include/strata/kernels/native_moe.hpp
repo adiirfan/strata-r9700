@@ -20,6 +20,17 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
 /// relative to `parts` and `hits`) the expert's part is parts + hits (the add moe_hit_add made in place), then the combine as before.
 /// Only the k = 10 vec4 case; `native_moe_combine_hits_supported` says whether a call may use it.
 bool native_moe_combine_hits_supported(const float* parts, const float* shared, const float* output, int64_t n_embd, int64_t k, int n_tok);
+// qwen-decode STRATA_LFUSE_NR: native_moe_combine_multi_hits_added with the shared expert's gate applied here
+// (sigmoid_scale_rows' expression and rounding) instead of by the shared expert
+// qwen-decode STRATA_COMBINE_MAPPED: copy_rows_from_mapped_after + the hits-added combine (gated when shared_gate is
+// set) in one launch; ymiss = the CPU's mapped rows, wait_flag/value = the CPU share's flag
+void native_moe_combine_multi_mapped(const float* ymiss, const float* hits, const int32_t* dst, const int32_t* count,
+                                     const float* weights, const float* shared, const float* shared_gate, float* output,
+                                     int64_t n_embd, int64_t k, int n_tok, const uint32_t* wait_flag, uint32_t wait_value,
+                                     void* stream);
+void native_moe_combine_multi_hits_added_gated(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                               const float* weights, const float* shared, const float* shared_gate, float* output,
+                                               int64_t n_embd, int64_t k, int n_tok, void* stream);
 void native_moe_combine_multi_hits_added(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
                                          const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
                                          int n_tok, void* stream);

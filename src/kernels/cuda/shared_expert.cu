@@ -225,8 +225,11 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
     }
+    // qwen-decode: gate and up in one grouped launch whatever their types (bitwise the two calls; STRATA_MMVQ_GROUP)
+    const MmvqGroupMember gu[2] = {{nw.gate_type, nw.gate_data, gate, (int) n_ff}, {nw.up_type, nw.up_data, up, (int) n_ff}};
+    const bool grouped = n_tok >= 2 && native_mmvq_group(gu, 2, x_q8_1, (int) n_embd, n_tok, stream);
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
-    if (!(pair && nw.gate_type == nw.up_type &&
+    if (!grouped && !(pair && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
         native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
         native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);

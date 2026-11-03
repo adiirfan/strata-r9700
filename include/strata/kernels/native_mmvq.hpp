@@ -138,6 +138,11 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
+// qwen-decode STRATA_MMVQ_GROUP (default on; 0: off): two matrices of the supported types (Q8_0, Q4_K, Q5_K, Q6_K,
+// IQ4_XS; two rows a block) on the same q8_1 input, 2-6 columns, in one launch; every output is bitwise native_mmvq's.  false (nothing
+// launched) where it does not apply: the caller then makes the separate calls.
+struct MmvqGroupMember { int type; const void* weights; float* y; int n_out; };
+bool native_mmvq_group(const MmvqGroupMember* members, int count, const void* x_q8_1, int n_in, int ncols, void* stream);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,

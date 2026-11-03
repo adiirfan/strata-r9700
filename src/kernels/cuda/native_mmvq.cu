@@ -1168,19 +1168,15 @@ static bool s26_tsum_on() {
 
 // S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
-template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false>
-__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
-__global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
-                                         int n_in, int n_out,
-                                         const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
+// qwen-decode: the kernel's body, for block `bxi` of a launch over (w, y) - native_mmvq_multi_kernel below and the
+// grouped launch (native_mmvq_group: several matrices on one input, each block running its matrix's own code)
+template<typename F, int NCOLS, int NW, int ROWS, bool TS>
+__device__ __forceinline__ void mmvq_multi_body(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
+                                                int n_in, int n_out, int bxi) {
     const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
-    int bxi = int(blockIdx.x);
-    if constexpr (PAIR) {
-        if (bxi >= n_out / ROWS) { bxi -= n_out / ROWS; w = w2; y = y2; }
-    }
     const int row0 = ROWS * bxi;
     const int blocks_per_row = n_in / F::DIV;
     const int x_stride = n_in / Q8K;                   // Q8_1 blocks per activation column
@@ -1263,6 +1259,17 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
             if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
         }
     }
+}
+template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false>
+__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
+__global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
+                                         int n_in, int n_out,
+                                         const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
+    int bxi = int(blockIdx.x);
+    if constexpr (PAIR) {
+        if (bxi >= n_out / ROWS) { bxi -= n_out / ROWS; w = w2; y_ = y2; }
+    }
+    mmvq_multi_body<F, NCOLS, NW, ROWS, TS>(w, x_, y_, n_in, n_out, bxi);
 }
 
 // MODEL-UPDATE: the dense Q8_0 projections of Unsloth's files (all of attention, SSM and the shared expert are Q8_0
@@ -1504,6 +1511,60 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
 }
 
+// ---- qwen-decode: several matrices on the same q8_1 input in ONE launch (native_mmvq_group).  Each matrix gets the
+// blocks its own launch_multi_n launch would have (rows 1 or 2 a block, the exact layout), and each block runs that
+// launch's kernel body: every output is bitwise the separate launches'.
+constexpr int kGroupMax = 4;
+using Q80S8 = SmallTraits<Q80Block, 8>;
+struct MmvqGroupArgs {
+    const void* w[kGroupMax];
+    float* y[kGroupMax];
+    int type[kGroupMax], rows[kGroupMax], n_out[kGroupMax], blocks[kGroupMax];
+    int count;
+};
+// one instantiation per (first type, second type): a kernel that can run every type keeps the registers of the
+// heaviest and fits fewer blocks (measured slower grouped that way than as two launches)
+template<int NCOLS, typename FA, typename FB>
+__launch_bounds__(WARPS * WARP, 4)
+__global__ void native_mmvq_group2_kernel(MmvqGroupArgs g, const Q81Block* x, int n_in) {
+    const int b = int(blockIdx.x);
+    if (b < g.blocks[0])
+        mmvq_multi_body<FA, NCOLS, WARPS, 2, false>(static_cast<const typename FA::Block*>(g.w[0]), x, g.y[0], n_in, g.n_out[0], b);
+    else
+        mmvq_multi_body<FB, NCOLS, WARPS, 2, false>(static_cast<const typename FB::Block*>(g.w[1]), x, g.y[1], n_in, g.n_out[1],
+                                                    b - g.blocks[0]);
+}
+template<int NCOLS, typename FA>
+bool group2_launch_b(const MmvqGroupArgs& g, const Q81Block* x, int n_in, unsigned total, cudaStream_t s) {
+    const dim3 threads(WARP, WARPS);
+    switch (g.type[1]) {
+        case 8: native_mmvq_group2_kernel<NCOLS, FA, Q80S8><<<total, threads, 0, s>>>(g, x, n_in); return true;
+        case 12: native_mmvq_group2_kernel<NCOLS, FA, Q4KTraits><<<total, threads, 0, s>>>(g, x, n_in); return true;
+        case 13: native_mmvq_group2_kernel<NCOLS, FA, Q5KTraits><<<total, threads, 0, s>>>(g, x, n_in); return true;
+        case 14: native_mmvq_group2_kernel<NCOLS, FA, Q6KTraits><<<total, threads, 0, s>>>(g, x, n_in); return true;
+        case 23: native_mmvq_group2_kernel<NCOLS, FA, IQ4XSTraits><<<total, threads, 0, s>>>(g, x, n_in); return true;
+    }
+    return false;
+}
+template<int NCOLS>
+bool group2_launch(const MmvqGroupArgs& g, const Q81Block* x, int n_in, unsigned total, cudaStream_t s) {
+    switch (g.type[0]) {
+        case 8: return group2_launch_b<NCOLS, Q80S8>(g, x, n_in, total, s);
+        case 12: return group2_launch_b<NCOLS, Q4KTraits>(g, x, n_in, total, s);
+        case 13: return group2_launch_b<NCOLS, Q5KTraits>(g, x, n_in, total, s);
+        case 14: return group2_launch_b<NCOLS, Q6KTraits>(g, x, n_in, total, s);
+        case 23: return group2_launch_b<NCOLS, IQ4XSTraits>(g, x, n_in, total, s);
+    }
+    return false;
+}
+template<typename F>
+int group_rows(int n_in, int n_out) {   // launch_multi_n's choice (the exact layout): 1 or 2 rows a block
+    static const bool rows1 = [] {
+        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) ? 1 : 2;
+}
 template<typename F>
 void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                   void* stream) {
@@ -2916,6 +2977,50 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
         throw std::length_error("native MMVQ weight byte count overflows size_t");
     }
     return row_bytes * std::size_t(n_out);
+}
+
+bool native_mmvq_group(const MmvqGroupMember* members, int count, const void* x_q8_1, int n_in, int ncols, void* stream) {
+    static const bool env_on = [] { const char* v = std::getenv("STRATA_MMVQ_GROUP"); return !v || v[0] != '0'; }();
+    if (!env_on || count != 2 || ncols < 2 || ncols > 6 || !g_multi_exact || b6_rows_mode() > 0 ||
+        s26_tsum_on() || native_q6_k_packed_enabled() || native_q8_0_packed_enabled() || !stream || !x_q8_1)
+        return false;
+#if defined(STRATA_HIP_GFX906)
+    if (!g_wave_off) return false;
+#endif
+    MmvqGroupArgs g{};
+    g.count = count;
+    unsigned total = 0;
+    for (int i = 0; i < count; ++i) {
+        const MmvqGroupMember& m = members[i];
+        if (!m.weights || !m.y || m.n_out <= 0) return false;
+        int rows = 0;
+        switch (m.type) {
+            case 8: if (n_in % 32) return false; rows = group_rows<Q80S8>(n_in, m.n_out); break;
+            case 12: if (n_in % 256) return false; rows = group_rows<Q4KTraits>(n_in, m.n_out); break;
+            case 13: if (n_in % 256) return false; rows = group_rows<Q5KTraits>(n_in, m.n_out); break;
+            case 14: if (n_in % 256) return false; rows = group_rows<Q6KTraits>(n_in, m.n_out); break;
+            case 23: if (n_in % 256) return false; rows = group_rows<IQ4XSTraits>(n_in, m.n_out); break;
+            default: return false;
+        }
+        if (rows != 2) return false;   // the one-row layout (large Q8_0) keeps its own launch
+        g.w[i] = m.weights; g.y[i] = m.y; g.type[i] = m.type; g.rows[i] = rows; g.n_out[i] = m.n_out;
+        g.blocks[i] = rows == 1 ? m.n_out : (m.n_out + 1) / 2;
+        total += (unsigned) g.blocks[i];
+    }
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    bool ok = false;
+    switch (ncols) {
+        case 2: ok = group2_launch<2>(g, x, n_in, total, s); break;
+        case 3: ok = group2_launch<3>(g, x, n_in, total, s); break;
+        case 4: ok = group2_launch<4>(g, x, n_in, total, s); break;
+        case 5: ok = group2_launch<5>(g, x, n_in, total, s); break;
+        case 6: ok = group2_launch<6>(g, x, n_in, total, s); break;
+        default: return false;
+    }
+    if (!ok) return false;
+    launch_check();
+    return true;
 }
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,

@@ -621,6 +621,59 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
     }
 }
 
+// qwen-decode STRATA_LAYER_PF: read a set of buffers so they sit in the card's memory-side cache (64 MB on the R9700)
+// when the main stream gets to them (Flint's k_touch); the values are not used
+struct TouchSet { const uint4* p[kTouchMax]; uint32_t n16[kTouchMax]; int n; };
+__global__ void __launch_bounds__(256) touch_kernel(TouchSet T, unsigned* sink) {
+    uint32_t a = 0;
+    for (int j = 0; j < T.n; ++j)
+        for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < T.n16[j]; i += gridDim.x * 256) {
+            const uint4 v = T.p[j][i];
+            a ^= v.x ^ v.w;
+        }
+    if (a == 0x9e3779b9u) *sink = a;
+}
+
+// qwen-decode STRATA_PCIE_CHAIN: wait_flag_ge_kernel, fetch_blobs_kernel and rebase_ptrs_kernel in one launch - every
+// block waits for the flag, copies its share of the blobs, and the last block to finish rebases the pointers (after
+// every block has read them; `done` is back to 0 for the next launch)
+__global__ void wait_fetch_rebase_kernel(const volatile uint32_t* flag, uint32_t value, unsigned long long* ptr,
+                                         const int32_t* __restrict__ n, uint4* __restrict__ dst, long long per,
+                                         unsigned long long base, long long bytes, unsigned int* done) {
+    __shared__ int last;
+    // one block polls the host's flag over PCIe and opens a device word (done[1]) for the others: 384 blocks polling
+    // host memory cost more than the launches this saves
+    volatile unsigned int* go = done + 1;
+    if (threadIdx.x == 0) {
+        if (blockIdx.x == 0) {
+            while (*flag < value) strata_spin_pause();
+            __threadfence_system();
+            *go = 1u;
+            __threadfence();
+        } else {
+            while (*go == 0u) strata_spin_pause();
+            __threadfence();
+        }
+    }
+    __syncthreads();
+    const int cnt = *n;
+    const long long total = (long long) cnt * per;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long) gridDim.x * blockDim.x) {
+        const long long k = i / per, off = i - k * per;
+        dst[i] = ((const uint4*) ptr[k])[off];
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (last) {
+        __threadfence();
+        for (int k = threadIdx.x; k < cnt; k += blockDim.x) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
+        if (threadIdx.x == 0) { done[1] = 0u; *done = 0u; }
+    }
+}
+
 __global__ void res_patch_kernel(int32_t* __restrict__ table, const volatile int32_t* pairs, int n) {
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) table[pairs[2 * k]] = pairs[2 * k + 1];
 }
@@ -720,6 +773,26 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     check("fetch_blobs");
 }
 
+void touch_buffers(const void* const* ptrs, const uint64_t* bytes, int n, int blocks, unsigned* sink, void* stream) {
+    TouchSet T{};
+    for (int i = 0; i < n && T.n < kTouchMax; ++i) {
+        if (ptrs[i] == nullptr || bytes[i] < 16) continue;
+        T.p[T.n] = (const uint4*) ptrs[i];
+        T.n16[T.n] = (uint32_t) (bytes[i] / 16);
+        ++T.n;
+    }
+    if (T.n == 0) return;
+    touch_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(T, sink);
+    check("touch_buffers");
+}
+void wait_fetch_rebase(const uint32_t* flag, uint32_t value, unsigned long long* ptr, const int32_t* n, uint8_t* dst,
+                       int64_t blob_bytes, unsigned int* done, void* stream) {
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "wait_fetch_rebase: blob size must be a multiple of 16\n"); std::exit(1); }
+    wait_fetch_rebase_kernel<<<128, 256, 0, (cudaStream_t) stream>>>((const volatile uint32_t*) flag, value, ptr, n, (uint4*) dst,
+                                                                       (long long) (blob_bytes / 16), (unsigned long long) dst,
+                                                                       (long long) blob_bytes, done);
+    check("wait_fetch_rebase");
+}
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
     if (n <= 0) return;
     res_patch_kernel<<<(n + 255) / 256 < 64 ? (n + 255) / 256 : 64, 256, 0, (cudaStream_t) stream>>>(table, pairs, n);

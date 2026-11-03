@@ -475,6 +475,10 @@ private:
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
+    unsigned int* wfr_done_ = nullptr;    ///< qwen-decode STRATA_PCIE_CHAIN: the last-block counter of wait_fetch_rebase
+    cudaStream_t pf_s_ = nullptr;         ///< qwen-decode STRATA_LAYER_PF: the prefetch side stream, its fork/join events, a sink word
+    cudaEvent_t pf_ev_ = nullptr, pf_join_ = nullptr;
+    unsigned* pf_sink_ = nullptr;
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
