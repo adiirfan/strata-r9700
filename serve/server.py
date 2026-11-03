@@ -60,7 +60,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, FlintParser, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, FlintParser, HarmonyParser, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -3693,6 +3693,17 @@ class ByteTokenizer:
 
 
 # ------------------------------------------------------------------------------------------------ core
+def gptoss_kwargs(kwargs: dict) -> dict:
+    """gpt-oss's harmony template knows low / medium / high (its default medium), and thinking cannot be turned off
+    (low instead)."""
+    kw = dict(kwargs)
+    e = kw.pop("reasoning_effort", None)
+    if kw.pop("enable_thinking", None) is False:
+        e = "low"
+    kw["reasoning_effort"] = {"xhigh": "high", "max": "high", None: "medium", "": "medium"}.get(e, e)
+    return kw
+
+
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
     characters and holds a multi-byte character split across tokens until it is complete (invalid bytes become
@@ -3930,7 +3941,7 @@ class Service:
         # <|end_of_text|> or by starting the next one: <|user|>, <|observation|>, <|developer|>; Ling with <|role_end|>)
         self.stop_ids = set()
         for marker in (IM_END, "<|endoftext|>", "</s>", "<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>",
-                       "<|role_end|>"):
+                       "<|role_end|>", "<|return|>", "<|call|>"):
             ids = tokenizer.encode(marker, parse_special=True)
             if len(ids) == 1:
                 self.stop_ids.update(ids)
@@ -4751,6 +4762,8 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        if MODEL_FAMILY == "gptoss":
+            return self.template.render(messages, tools=tools, **gptoss_kwargs(kwargs))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -5023,6 +5036,8 @@ class Service:
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
+            if MODEL_FAMILY == "gptoss":
+                kw = gptoss_kwargs(kw)
             text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
@@ -5154,7 +5169,7 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         # (Flint and Ling write their calls in their own form: FlintParser turns them into the template form as they stream)
-        parser = (FlintParser if MODEL_FAMILY in ("flint", "ling") else self.parser_cls)(
+        parser = (FlintParser if MODEL_FAMILY in ("flint", "ling") else HarmonyParser if MODEL_FAMILY == "gptoss" else self.parser_cls)(
             thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery, declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token

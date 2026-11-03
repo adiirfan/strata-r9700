@@ -54,6 +54,7 @@ class ChatTemplate:
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = lambda fmt: __import__("datetime").datetime.now().strftime(fmt)   # (gpt-oss's template)
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
         # GLM-5.x (as Project Maya renders it): the template knows reasoning_effort "low" and "high" only - anything
@@ -1712,5 +1713,110 @@ class FlintParser(OutputParser):
 
     def finish(self, *a, **kw):
         tail = self._translate(final=True)
+        out = super().feed(tail) if tail else []
+        return out + super().finish(*a, **kw)
+
+
+class HarmonyParser(OutputParser):
+    """gpt-oss writes OpenAI's harmony format: `<|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>
+    final<|message|>...`, and a tool call as `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{...}`
+    ended by <|call|> (a stop token, so the call is completed in finish()). This rewrites that, as it streams, into the
+    form OutputParser reads: the analysis channel is the reasoning, the final channel follows `</think>`, and a call
+    becomes `<tool_call>\\n<function=NAME>\\n<parameter=K>\\nV\\n</parameter>...` from its JSON arguments."""
+
+    MARKS = ("<|start|>", "<|end|>", "<|channel|>", "<|message|>", "<|constrain|>", "<|return|>", "<|call|>")
+
+    def __init__(self, *a, **kw):
+        kw["thinking"] = True
+        super().__init__(*a, **kw)
+        self.hstate = "header"       # header (the generation prompt ended at the role) | body | between
+        self.hbuf = ""
+        self.header = ""
+        self.channel = ""
+        self.recipient = ""
+        self.args = ""
+        self.closed = False          # </think> sent
+
+    def _close_think(self) -> str:
+        if self.closed:
+            return ""
+        self.closed = True
+        return THINK_END
+
+    def _call(self) -> str:
+        name = self.recipient.split(".", 1)[1] if self.recipient.startswith("functions.") else self.recipient
+        try:
+            args = json.loads(self.args) if self.args.strip() else {}
+        except ValueError:
+            args = None
+        self.args = ""
+        out = [self._close_think(), "<tool_call>\n<function=" + name + ">\n"]
+        if isinstance(args, dict):
+            for k, v in args.items():
+                out.append(f"<parameter={k}>\n{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}\n</parameter>\n")
+        out.append("</function>\n</tool_call>")
+        return "".join(out)
+
+    def _mark(self, m: str) -> str:
+        if m == "<|message|>" and self.hstate == "header":
+            h = self.header
+            self.channel = h.split("<|channel|>", 1)[1].split()[0] if "<|channel|>" in h and h.split("<|channel|>", 1)[1].split() else ""
+            to = [w for w in h.replace("<|channel|>", " ").replace("<|constrain|>", " ").split() if w.startswith("to=")]
+            self.recipient = to[0][3:] if to else ""
+            self.hstate, self.header = "body", ""
+            return self._close_think() if self.channel == "final" else ""
+        if self.hstate == "header":
+            self.header += m
+            return ""
+        if m in ("<|end|>", "<|call|>", "<|return|>") and self.hstate == "body":
+            self.hstate = "between"
+            return self._call() if self.recipient and m != "<|return|>" else ""
+        if m == "<|start|>":
+            self.hstate, self.header = "header", ""
+            return ""
+        return ""
+
+    def _plain(self, t: str) -> str:
+        if self.hstate == "header":
+            self.header += t
+            return ""
+        if self.hstate == "between":
+            return ""
+        if self.recipient:
+            self.args += t
+            return ""
+        return t
+
+    def _translate(self, final: bool = False) -> str:
+        out = []
+        while self.hbuf:
+            i = self.hbuf.find("<|")
+            if i < 0:
+                tail = self.hbuf[-1:] if not final and self.hbuf.endswith("<") else ""
+                out.append(self._plain(self.hbuf[:len(self.hbuf) - len(tail)]))
+                self.hbuf = tail
+                break
+            out.append(self._plain(self.hbuf[:i]))
+            rest = self.hbuf[i:]
+            m = next((t for t in self.MARKS if rest.startswith(t)), None)
+            if m is None and not final and any(t.startswith(rest) for t in self.MARKS):
+                self.hbuf = rest
+                break
+            if m is None:
+                out.append(self._plain("<|"))
+                self.hbuf = rest[2:]
+            else:
+                out.append(self._mark(m))
+                self.hbuf = rest[len(m):]
+        return "".join(out)
+
+    def feed(self, delta: str) -> list[Event]:
+        self.hbuf += delta
+        return super().feed(self._translate())
+
+    def finish(self, *a, **kw):
+        tail = self._translate(final=True)
+        if self.hstate == "body" and self.recipient:
+            tail += self._call()
         out = super().feed(tail) if tail else []
         return out + super().finish(*a, **kw)
