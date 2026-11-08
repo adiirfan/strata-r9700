@@ -11302,8 +11302,17 @@ int main(int argc, char** argv) {
             st->eof = true;
             st->cv.notify_one();
         }).detach();
+        // STRATA_ELASTIC_RAM: while no request is in, the wait wakes every 50 ms for the RAM copy's check (elastic_tick)
+        std::function<void()> idle_hook;
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
+            if (idle_hook) {
+                while (!in_cv.wait_for(lk, std::chrono::milliseconds(50), [&] { return !in_lines.empty() || in_eof; })) {
+                    lk.unlock();
+                    idle_hook();
+                    lk.lock();
+                }
+            }
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
@@ -11311,6 +11320,14 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
+        // (next_line runs only while no batch slot is active, so idle here means nothing is being computed)
+        if (src.elastic() && !multi_gpu) {
+            idle_hook = [&] {
+                if (!pending.empty()) apply_pending(true);   // the last adaptive copies land first
+                if (!pending.empty() || arefill.active()) return;
+                src.elastic_tick(host_res.data());
+            };
+        }
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
         // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
@@ -15381,6 +15398,10 @@ int main(int argc, char** argv) {
                     }
                 }
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+                // STRATA_ELASTIC_RAM: a window boundary with no adaptive copy in flight - nothing reads the RAM copy now
+                if (src.elastic() && pending.empty() && !arefill.active() && !aflipped && !multi_gpu &&
+                    (!ajob || astate == AState::Idle))
+                    src.elastic_tick(host_res.data());
                 // STRATA_RAM_ADAPT=<n> (opt-in, the resident RAM mode on one GPU): the RAM copy is chosen once, at
                 // start, so an expert it does not hold is read from the file every time the conversation routes to
                 // it.  With this, before a window and while no adaptive round is in flight, up to n experts the windows

@@ -1525,6 +1525,17 @@ void FileExpertSource::close() {
     ram_stop();
     io_stop();
     inputs_.clear();
+#if defined(__linux__)
+    if (el_base_ != nullptr) {   // STRATA_ELASTIC_RAM: the blocks, then the reserved range
+        el_stop_fill();
+        for (int64_t c = el_backed_ - 1; c >= 0; --c) el_drop(c);
+        (void) munmap(el_base_, (size_t) el_reserved_);
+        el_base_ = nullptr;
+        el_reserved_ = 0;
+        el_backed_ = 0;
+        complement_arena_ = nullptr;
+    }
+#endif
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
         else {
@@ -3510,6 +3521,30 @@ bool FileExpertSource::pin_cache_complement(
     }
 #endif
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
+    elastic_ = false;
+#if defined(__linux__)
+    {
+        // STRATA_ELASTIC_RAM=1: the budget is the copy's largest size, held in blocks that come and go with the free RAM
+        // (see elastic_tick).  One GPU and the plain budget path only.
+        const char* ev = std::getenv("STRATA_ELASTIC_RAM");
+        if (ev != nullptr && ev[0] == '1') {
+            if (pin && budget_bytes > 0 && !what_fits && additional_gpu_pairs.empty() && stage_lend_regions_.empty() &&
+                !(std::getenv("STRATA_EXCHANGE_ROTATE") && std::strcmp(std::getenv("STRATA_EXCHANGE_ROTATE"), "1") == 0)) {
+                elastic_ = true;
+                auto gib = [](const char* k, double d) { const char* v = std::getenv(k); return v && *v ? std::atof(v) : d; };
+                el_low_ = (uint64_t) (gib("STRATA_ELASTIC_LOW_GIB", 6.0) * 1073741824.0);
+                el_high_ = (uint64_t) (gib("STRATA_ELASTIC_HIGH_GIB", 14.0) * 1073741824.0);
+                el_grow_delay_s_ = gib("STRATA_ELASTIC_GROW_DELAY_S", 10.0);
+                el_min_chunks_ = (int64_t) gib("STRATA_ELASTIC_MIN_GIB", 0.0);
+                if (const char* f = std::getenv("STRATA_ELASTIC_CAP_FILE")) el_cap_file_ = f;
+                if (el_high_ < el_low_ + (2ull << 30)) el_high_ = el_low_ + (2ull << 30);
+            } else {
+                std::fprintf(stderr, "FileExpertSource: STRATA_ELASTIC_RAM ignored: it needs --resident-budget-gib, one GPU "
+                                     "and no exchange rotation\n");
+            }
+        }
+    }
+#endif
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
@@ -3525,7 +3560,7 @@ bool FileExpertSource::pin_cache_complement(
         const uint64_t available = std::min(physical, budget_commit);
         const char* limit = budget_commit < physical ? "commit" : "RAM";
         const uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
-        if (budget_bytes > clamped) {
+        if (budget_bytes > clamped && !elastic_) {
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
             // lower).  An unclamped budget is unchanged.
@@ -3642,7 +3677,7 @@ bool FileExpertSource::pin_cache_complement(
         }
         const uint64_t available = std::min(physical, commit);
         budget = available > headroom_bytes ? available - headroom_bytes : 0;
-        if (bytes > budget) {
+        if (bytes > budget && !elastic_) {
             char message[320];
             std::snprintf(message, sizeof message,
                           "FileExpertSource: resident complement %.2f GiB exceeds available %s (%.2f GiB) minus the "
@@ -3709,10 +3744,58 @@ bool FileExpertSource::pin_cache_complement(
         stage_lent_bytes = bytes - before;
     }
 
+#if defined(__linux__)
+    if (elastic_ && bytes > 0) {
+        // STRATA_ELASTIC_RAM: the plan again in blocks - the same experts in the same order (the loan's first, then the
+        // profile's hottest), moved on so that no blob crosses a block boundary (one GPU registration per block: a copy
+        // over two registrations is refused).  Each block records its positions and the expert planned for each.
+        el_chunk_bytes_ = 1ull << 30;
+        std::vector<size_t> order;
+        for (size_t i = 0; i < offsets.size(); ++i)
+            if (offsets[i] != kNoComplement) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+        uint64_t at = 0;
+        el_chunks_.clear();
+        for (const size_t i : order) {
+            const int32_t layer = (int32_t) (i / (size_t) n_expert_);
+            const uint64_t b = layer_blob_bytes_[(size_t) layer];
+            if (b > el_chunk_bytes_) { elastic_ = false; break; }
+            if (at % el_chunk_bytes_ + b > el_chunk_bytes_) at = (at / el_chunk_bytes_ + 1) * el_chunk_bytes_;
+            const size_t c = (size_t) (at / el_chunk_bytes_);
+            while (el_chunks_.size() <= c) {
+                ElChunk ch;
+                ch.off = (uint64_t) el_chunks_.size() * el_chunk_bytes_;
+                ch.len = el_chunk_bytes_;
+                el_chunks_.push_back(std::move(ch));
+            }
+            el_chunks_[c].pos.push_back({at, layer, (int32_t) (i % (size_t) n_expert_)});
+            offsets[i] = at;
+            at += b;
+        }
+        if (elastic_) {
+            bytes = (uint64_t) el_chunks_.size() * el_chunk_bytes_;
+            // the profile's order per layer: the fill of a block picks the next expert nothing holds from it
+            el_rank_.assign((size_t) n_layers_, {});
+            std::vector<char> seen(offsets.size(), 0);
+            if (rank != nullptr)
+                for (const auto& pr : *rank)
+                    if (pr.first >= 0 && pr.second >= 0 && pr.first < n_layers_ && pr.second < n_expert_) {
+                        const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
+                        if (!seen[i]) { seen[i] = 1; el_rank_[(size_t) pr.first].push_back(pr.second); }
+                    }
+            for (int64_t l = 0; l < n_layers_; ++l)
+                for (int64_t e = 0; e < n_expert_; ++e)
+                    if (!seen[(size_t) (l * n_expert_ + e)]) el_rank_[(size_t) l].push_back((int32_t) e);
+        } else {
+            std::fprintf(stderr, "FileExpertSource: STRATA_ELASTIC_RAM off: a blob is larger than a block\n");
+        }
+    }
+#endif
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
+    bool el_alloc = false;   ///< STRATA_ELASTIC_RAM: the arena is el_base_'s reserved range
     bool paced = false;         ///< #1250: the pages are taken in steps and page-locked afterwards
     uint64_t locked = 0;
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
@@ -3723,6 +3806,17 @@ bool FileExpertSource::pin_cache_complement(
 #endif
     auto release = [&]() {
         if (arena == nullptr) return;
+#if defined(__linux__)
+        if (el_alloc) {
+            for (int64_t c = el_backed_ - 1; c >= 0; --c) el_drop(c);
+            (void) munmap(el_base_, (size_t) el_reserved_);
+            el_base_ = nullptr;
+            el_reserved_ = 0;
+            el_backed_ = 0;
+            arena = nullptr;
+            return;
+        }
+#endif
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
@@ -3752,6 +3846,47 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
     };
+#endif
+#if defined(__linux__)
+    if (elastic_ && bytes > 0) {
+        // the whole plan's range reserved (no pages, no commit), then as many blocks backed as the RAM allows now
+        void* va = mmap(nullptr, (size_t) bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (va == MAP_FAILED) {
+            err = "FileExpertSource: STRATA_ELASTIC_RAM: cannot reserve the copy's address range";
+            return false;
+        }
+        el_base_ = (uint8_t*) va;
+        el_reserved_ = bytes;
+        el_backed_ = 0;
+        arena = va;
+        el_alloc = true;
+        uint64_t avail = 0;
+        (void) available_memory_bytes(avail);
+        const int64_t n_chunks = (int64_t) el_chunks_.size();
+        int64_t want = avail > el_high_ ? (int64_t) ((avail - el_high_) / el_chunk_bytes_) : 0;
+        want = std::max<int64_t>(std::min<int64_t>(want, n_chunks), std::min<int64_t>(el_min_chunks_, n_chunks));
+        std::fprintf(stderr, "FileExpertSource: elastic RAM copy: %lld blocks of 1 GiB planned (%.2f GiB of experts), %lld "
+                             "backed now (%.1f GiB available; give back under %.1f, take more over %.1f GiB)\n",
+                     (long long) n_chunks, (double) bytes / 1073741824.0, (long long) want, (double) avail / 1073741824.0,
+                     (double) el_low_ / 1073741824.0, (double) el_high_ / 1073741824.0);
+        for (int64_t c = 0; c < want; ++c) {
+            std::string e2;
+            if (!el_back(c, true, e2)) {
+                if (c == 0) { err = "FileExpertSource: STRATA_ELASTIC_RAM: " + e2; release(); return false; }
+                std::fprintf(stderr, "FileExpertSource: elastic RAM: block %lld not backed (%s)\n", (long long) c, e2.c_str());
+                break;
+            }
+            el_backed_ = c + 1;
+        }
+        // the experts of the blocks without pages: read from the files until a block takes them
+        for (size_t c = (size_t) el_backed_; c < el_chunks_.size(); ++c)
+            for (const ElPos& ps : el_chunks_[c].pos)
+                offsets[(size_t) ps.layer * (size_t) n_expert_ + (size_t) ps.plan] = kNoComplement;
+        host = (const uint8_t*) va;
+        device = (const uint8_t*) va;   // el_back checked that the GPU sees each block at its own address
+        pinned_ok = true;
+        note = "elastic, page-locked in 1 GiB blocks";
+    } else
 #endif
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
@@ -4119,7 +4254,7 @@ bool FileExpertSource::pin_cache_complement(
     if (maps_.empty() && !unmapped_) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
     for (const Map& m : maps_) if (!m.closed) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
 #endif
-    if (std::getenv("STRATA_VERIFY_COMPLEMENT") != nullptr && host != nullptr && bytes > 0) {
+    if (std::getenv("STRATA_VERIFY_COMPLEMENT") != nullptr && host != nullptr && bytes > 0 && !elastic_) {
         // tests: the copy's checksum (FNV-1a of each 1 GiB piece on its own thread, then of those), any reader
         constexpr uint64_t kPiece = 1ull << 30;
         const size_t pieces = (size_t) ((bytes + kPiece - 1) / kPiece);
@@ -4659,6 +4794,207 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
     if (complement_ready_ && complement_pinned_ && complement_device_ != nullptr)
         return layer >= 0 && layer < n_layers_;
     return device_alias(layer, 0) != nullptr;
+}
+
+// ================================ STRATA_ELASTIC_RAM ================================
+
+bool FileExpertSource::el_back(int64_t c, bool populate, std::string& err) {
+#if defined(__linux__)
+    if (el_base_ == nullptr || c < 0 || c >= (int64_t) el_chunks_.size()) { err = "no such block"; return false; }
+    uint8_t* p = el_base_ + (size_t) el_chunks_[(size_t) c].off;
+    const size_t len = (size_t) el_chunks_[(size_t) c].len;
+    void* m = mmap(p, len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | (populate ? MAP_POPULATE : 0), -1, 0);
+    if (m == MAP_FAILED || m != (void*) p) { err = std::string("mmap: ") + std::strerror(errno); return false; }
+    if (cudaHostRegister(p, len, cudaHostRegisterMapped | cudaHostRegisterPortable) != cudaSuccess) {
+        err = std::string("cudaHostRegister: ") + cudaGetErrorString(cudaGetLastError());
+        (void) mmap(p, len, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        return false;
+    }
+    void* d = nullptr;
+    if (cudaHostGetDevicePointer(&d, p, 0) != cudaSuccess || d != (void*) p) {
+        // the copy's one base pointer needs every block at the same address on the GPU (ROCm does this)
+        (void) cudaGetLastError();
+        err = "the GPU maps the block at another address";
+        (void) cudaHostUnregister(p);
+        (void) mmap(p, len, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        return false;
+    }
+    return true;
+#else
+    (void) c; (void) populate;
+    err = "Linux only";
+    return false;
+#endif
+}
+
+void FileExpertSource::el_drop(int64_t c) {
+#if defined(__linux__)
+    if (el_base_ == nullptr || c < 0 || c >= (int64_t) el_chunks_.size()) return;
+    uint8_t* p = el_base_ + (size_t) el_chunks_[(size_t) c].off;
+    const size_t len = (size_t) el_chunks_[(size_t) c].len;
+    (void) cudaHostUnregister(p);
+    (void) cudaGetLastError();
+    // a fresh PROT_NONE mapping over the block: its pages go back to the OS at once, the range stays reserved
+    (void) mmap(p, len, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#else
+    (void) c;
+#endif
+}
+
+void FileExpertSource::el_stop_fill() {
+    if (el_thread_.joinable()) {
+        el_cancel_.store(true);
+        el_thread_.join();
+    }
+    if (el_state_.load() == 2) el_drop(el_backed_);   // filled but never published
+    el_state_.store(0);
+    el_cancel_.store(false);
+}
+
+uint64_t FileExpertSource::elastic_backed_bytes() const {
+    return elastic_ ? (uint64_t) el_backed_ * el_chunk_bytes_ : 0;
+}
+
+void FileExpertSource::elastic_tick(const int32_t* host_res) {
+#if defined(__linux__)
+    if (!elastic_ || !complement_ready_ || el_base_ == nullptr || host_res == nullptr) return;
+    using SC = std::chrono::steady_clock;
+    const SC::time_point now = SC::now();
+    if (now - el_last_tick_ < std::chrono::milliseconds(100)) return;
+    el_last_tick_ = now;
+    const int64_t n_chunks = (int64_t) el_chunks_.size();
+    const double gib = 1073741824.0;
+    // a finished fill: its experts take their positions now, unless something holds them meanwhile (then the
+    // position stays empty until a later fill)
+    if (el_state_.load() == 2) {
+        el_thread_.join();
+        const auto t0 = SC::now();
+        const ElChunk& ch = el_chunks_[(size_t) el_backed_];
+        int64_t placed = 0;
+        for (size_t k = 0; k < ch.pos.size(); ++k) {
+            const int32_t e = el_pick_[k];
+            if (e < 0) continue;
+            const size_t i = (size_t) ch.pos[k].layer * (size_t) n_expert_ + (size_t) e;
+            // the planned expert may sit in VRAM too: the prompt loan's experts are kept in RAM on purpose
+            if (complement_offsets_[i] != kNoComplement || (e != ch.pos[k].plan && host_res[i] >= 0) ||
+                (!override_.empty() && override_[i] != nullptr))
+                continue;
+            complement_offsets_[i] = ch.pos[k].off;
+            ++placed;
+        }
+        ++el_backed_;
+        el_state_.store(0);
+        uint64_t avail = 0;
+        (void) available_memory_bytes(avail);
+        std::fprintf(stderr, "FileExpertSource: elastic RAM: %.0f GiB held (+1 block, %lld experts, %.1f GiB available, "
+                             "published in %.1f ms)\n", (double) el_backed_, (long long) placed, (double) avail / gib,
+                     std::chrono::duration<double, std::milli>(SC::now() - t0).count());
+        std::fflush(stderr);
+    } else if (el_state_.load() == 3) {
+        el_thread_.join();
+        el_state_.store(0);
+    }
+    uint64_t avail = 0;
+    if (!available_memory_bytes(avail)) return;
+    int64_t cap = n_chunks;
+    if (!el_cap_file_.empty()) {   // sysmon's hint: at most this many GiB (absent or unreadable: no cap)
+        std::ifstream f(el_cap_file_);
+        double v = -1;
+        if (f && (f >> v) && v >= 0) cap = std::min<int64_t>(cap, (int64_t) (v * gib / (double) el_chunk_bytes_));
+    }
+    int64_t drop = 0;
+    if (avail < el_low_) drop = (int64_t) ((el_low_ + (1ull << 30) - avail + el_chunk_bytes_ - 1) / el_chunk_bytes_);
+    drop = std::max<int64_t>(drop, el_backed_ - cap);
+    if (drop > 0) {
+        el_high_since_ = {};
+        if (el_state_.load() == 1) {   // a fill in progress gives its block back first
+            el_stop_fill();
+            --drop;
+        }
+        drop = std::min<int64_t>(drop, el_backed_ - std::min<int64_t>(el_min_chunks_, el_backed_));
+        if (drop <= 0) return;
+        // nothing may be reading the blocks: no staged exchange, no RAM promotion, no Foresight copy
+        if (!staged_.empty() || fs_swap_.load() != nullptr) return;
+        {
+            std::lock_guard<std::mutex> lk(ram_mu_);
+            if (!ram_jobs_.empty()) return;
+        }
+        const auto t0 = SC::now();
+        (void) cudaDeviceSynchronize();   // no copy out of a block may still be in flight
+        const uint64_t cut = el_chunks_[(size_t) (el_backed_ - drop)].off;
+        int64_t cleared = 0;
+        for (uint64_t& o : complement_offsets_)
+            if (o != kNoComplement && o >= cut) { o = kNoComplement; ++cleared; }
+        for (int64_t c = el_backed_ - 1; c >= el_backed_ - drop; --c) el_drop(c);
+        el_backed_ -= drop;
+        el_last_shrink_ = SC::now();
+        std::fprintf(stderr, "FileExpertSource: elastic RAM: %.0f GiB held (-%lld blocks, %lld experts to the files, %.1f "
+                             "GiB was available, %.1f ms)\n", (double) el_backed_, (long long) drop, (long long) cleared,
+                     (double) avail / gib, std::chrono::duration<double, std::milli>(SC::now() - t0).count());
+        std::fflush(stderr);
+        return;
+    }
+    // grow: one block at a time, once the room has stayed there a second and no block was given back lately
+    if (el_state_.load() != 0 || el_backed_ >= cap || avail < el_high_ + el_chunk_bytes_ ||
+        std::chrono::duration<double>(now - el_last_shrink_).count() < el_grow_delay_s_) {
+        if (avail < el_high_ + el_chunk_bytes_) el_high_since_ = {};
+        return;
+    }
+    if (el_high_since_ == SC::time_point{}) { el_high_since_ = now; return; }
+    if (now - el_high_since_ < std::chrono::seconds(1)) return;
+    el_high_since_ = {};
+    const int64_t c = el_backed_;
+    const ElChunk& ch = el_chunks_[(size_t) c];
+    std::vector<char> taken(complement_offsets_.size(), 0);
+    el_pick_.assign(ch.pos.size(), -1);
+    auto free_for = [&](size_t i) {
+        return complement_offsets_[i] == kNoComplement && host_res[i] < 0 && !taken[i] &&
+               (override_.empty() || override_[i] == nullptr);
+    };
+    for (size_t k = 0; k < ch.pos.size(); ++k) {
+        const int32_t L = ch.pos[k].layer;
+        size_t i = (size_t) L * (size_t) n_expert_ + (size_t) ch.pos[k].plan;
+        int32_t e = ch.pos[k].plan;
+        // the position's own expert first, wherever else it is (the loan's copies are of VRAM experts); else the
+        // hottest expert of the layer that neither VRAM nor RAM holds
+        const bool own = complement_offsets_[i] == kNoComplement && !taken[i] && (override_.empty() || override_[i] == nullptr);
+        if (!own) {
+            e = -1;
+            for (const int32_t r : el_rank_[(size_t) L]) {
+                const size_t j = (size_t) L * (size_t) n_expert_ + (size_t) r;
+                if (free_for(j)) { e = r; i = j; break; }
+            }
+        }
+        if (e < 0) continue;
+        taken[i] = 1;
+        el_pick_[k] = e;
+    }
+    el_cancel_.store(false);
+    el_state_.store(1);
+    el_thread_ = std::thread([this, c] {
+        strata::platform::name_this_thread("strata-elastic");
+        const ElChunk& chk = el_chunks_[(size_t) c];
+        std::string e2;
+        if (!el_back(c, true, e2)) {
+            std::fprintf(stderr, "FileExpertSource: elastic RAM: block %lld not backed (%s)\n", (long long) c, e2.c_str());
+            el_state_.store(3);
+            return;
+        }
+        for (size_t k = 0; k < chk.pos.size(); ++k) {
+            if (el_cancel_.load()) break;
+            if (el_pick_[k] < 0) continue;
+            if (!copy_from_files(chk.pos[k].layer, el_pick_[k], el_base_ + (size_t) chk.pos[k].off)) el_pick_[k] = -1;
+        }
+        if (el_cancel_.load()) {
+            el_drop(c);
+            el_state_.store(3);
+            return;
+        }
+        el_state_.store(2);
+    });
+#else
+    (void) host_res;
+#endif
 }
 
 // ================================ THE ADAPTER ================================

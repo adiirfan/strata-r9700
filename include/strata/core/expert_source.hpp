@@ -767,6 +767,15 @@ public:
     uint64_t locked_bytes() const { return complement_locked_; }
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
+    /// STRATA_ELASTIC_RAM=1 (Linux, one GPU, --resident-budget-gib N): the RAM copy is planned at N GiB in 1 GiB
+    /// blocks, of which only as many hold experts as the RAM allows.  elastic_tick gives the coldest blocks back
+    /// when the free RAM falls under STRATA_ELASTIC_LOW_GIB and fills the next one (read on a helper thread) once it
+    /// has stayed above STRATA_ELASTIC_HIGH_GIB; the experts of a missing block are read from the files meanwhile.
+    bool elastic() const { return elastic_; }
+    /// The main thread only, where nothing reads the RAM copy: a decode window boundary with no adaptive copies in
+    /// flight, or idle between requests.  `host_res`: the VRAM tier's slot per (layer, expert), < 0 not resident.
+    void elastic_tick(const int32_t* host_res);
+    uint64_t elastic_backed_bytes() const;
 
     // ---- the resident RAM mode and the adaptive tier.  A swap puts `in` (held here) into a GPU slot and evicts
     // `out` (held only by that slot).  Before the slot is overwritten the caller copies it back into an exchange
@@ -1199,6 +1208,30 @@ private:
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
+    // STRATA_ELASTIC_RAM: the copy's blocks.  Blocks [0, el_backed_) hold pages and are registered with the GPU; the
+    // rest of the reserved range is PROT_NONE, and no offset points into it.  Positions are fixed per block (a blob of
+    // one layer's size each); which expert sits in a position can change (exchanges, refills).
+    struct ElPos { uint64_t off; int32_t layer, plan; };
+    struct ElChunk { uint64_t off = 0, len = 0; std::vector<ElPos> pos; };
+    bool elastic_ = false;
+    uint64_t el_chunk_bytes_ = 1ull << 30;
+    uint8_t* el_base_ = nullptr;                  ///< the reserved range (the copy's base)
+    uint64_t el_reserved_ = 0;
+    std::vector<ElChunk> el_chunks_;
+    int64_t el_backed_ = 0;
+    std::vector<std::vector<int32_t>> el_rank_;   ///< per layer, the experts hottest first (the profile)
+    std::thread el_thread_;
+    std::atomic<int> el_state_{0};                ///< the fill: 0 none, 1 running, 2 ready, 3 failed
+    std::atomic<bool> el_cancel_{false};
+    std::vector<int32_t> el_pick_;                ///< the fill: the expert for each position of the next block (-1 none)
+    std::chrono::steady_clock::time_point el_last_tick_{}, el_last_shrink_{}, el_high_since_{};
+    uint64_t el_low_ = 6ull << 30, el_high_ = 14ull << 30;
+    double el_grow_delay_s_ = 10.0;
+    int64_t el_min_chunks_ = 0;
+    std::string el_cap_file_;
+    bool el_back(int64_t c, bool populate, std::string& err);   ///< pages + GPU registration for block c
+    void el_drop(int64_t c);                                    ///< registration off, pages back to the OS
+    void el_stop_fill();
     int64_t budget_lend_keep_from_ = -1;   // STRATA_BUDGET_LEND_GIB: the first slot whose expert the budget keeps in RAM
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
