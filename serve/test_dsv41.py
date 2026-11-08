@@ -255,7 +255,7 @@ class Parser(unittest.TestCase):
 
     def test_the_plain_parser_is_unchanged(self):
         p = OutputParser(thinking=False, tools=self.TOOLS)
-        evs = p.feed("<tool_call>\n<function=lookup>\n<parameter=id>\n5\n</parameter>\n</function>\n</tool_call>")
+        evs = p.feed("<tool_call>\n<function=lookup>\n<parameter=id>\n5\n</parameter>\n</function>\n</tool_call>") + p.finish("stop")   # #4701: the end of the turn settles a closed call
         self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"id": 5}])
         self.assertTrue(p.clean)
 
@@ -562,10 +562,12 @@ class Api(ApiBase):
         self.chat()
         self.assertNotIn("strata_prefix", self.engine.last_sampling)     # no system message
         body = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], "max_tokens": 40}
-        for off in (None, "0"):                                           # off by default, and when switched off
-            self.auto_pin(off)
-            self.post("/v1/chat/completions", body)
-            self.assertNotIn("strata_prefix", self.engine.last_sampling)
+        self.auto_pin("0")                                                # switched off
+        self.post("/v1/chat/completions", body)
+        self.assertNotIn("strata_prefix", self.engine.last_sampling)
+        self.auto_pin(None)                                               # on by default
+        self.post("/v1/chat/completions", body)
+        self.assertIn("strata_prefix", self.engine.last_sampling)
 
     def test_a_clients_own_prefix_wins(self):
         self.start("ok")
@@ -600,7 +602,7 @@ class SlotEnv(unittest.TestCase):
     def test_deepseek_gets_a_folder_in_the_data_folder_and_the_default_switch(self):
         env = self.env({"arch": "deepseek41", "log": str(Path("data") / "strata-deepseek.log"), "args": []})
         self.assertEqual(Path(env["STRATA_DS4_SLOT_DIR"]), Path("data") / "ds4-slots")
-        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "0")
+        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "1")
         self.assertEqual(env["STRATA_DS4_SLOT_GB"], "2")
 
     def test_the_configs_own_settings_win(self):
@@ -757,6 +759,34 @@ class PickTemplateTests(unittest.TestCase):
     def test_fixture_is_accepted(self):
         from serve import dsml
         self.assertTrue(dsml.v41_template_ok(dsml.FIXTURE_TEMPLATE.read_text(encoding="utf-8")))
+
+
+class ArchFromTokenizer(unittest.TestCase):
+    """#4137: a config without "arch" (serve/server.py run on its own) must not serve DeepSeek with the Qwen stop ids."""
+
+    def test_a_deepseek_tokenizer_without_an_arch_is_deepseek41(self):
+        self.assertEqual(server.arch_from_tokenizer(None, "deepseek3"), "deepseek41")
+        self.assertEqual(server.arch_from_tokenizer("", "deepseek3"), "deepseek41")
+
+    def test_an_arch_the_config_names_is_kept(self):
+        self.assertEqual(server.arch_from_tokenizer("qwen4exp", "deepseek3"), "qwen4exp")
+        self.assertEqual(server.arch_from_tokenizer("deepseek41", "qwen35"), "deepseek41")
+
+    def test_a_qwen_tokenizer_names_nothing(self):
+        self.assertIsNone(server.arch_from_tokenizer(None, "qwen35"))
+        self.assertIsNone(server.arch_from_tokenizer(None, None))
+
+    def test_without_the_family_the_pieces_of_im_end_are_not_stop_ids_and_the_end_token_is(self):
+        # what the reporter's config got (#4137, #4576): the DeepSeek tokenizer splits <|im_end|> into pieces, so "|", ">" and "im" (Nerazim)
+        # stopped a reply, and the end token (id 1) did not stop it at all
+        tok = mini_tokenizer()
+        wrong = Service(DsEngine(tok, "x"), tok, ChatTemplate(TEMPLATE))
+        self.assertIn(EOS, wrong.stop_ids)
+        self.assertFalse(wrong.stop_ids & set(tok.encode("|", parse_special=True)))
+        right = Service(DsEngine(tok, "x"), tok, ChatTemplate(TEMPLATE))
+        right.set_family("deepseek41")
+        self.addCleanup(frontend.use_family, None)
+        self.assertEqual(right.stop_ids, {EOS})
 
 
 if __name__ == "__main__":

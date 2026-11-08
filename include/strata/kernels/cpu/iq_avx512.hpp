@@ -8,6 +8,9 @@
 namespace strata::kernels::cpu {
 
 bool iq512_supported(int ggml_type) noexcept;
+/// Whether the grid lookups of these rows are gathers (the default where cpu_gather_fast(), STRATA_IQ_GATHER=1 / 0 force it): the
+/// same words, so the same bits as the scalar lookups, and 1.3-2x faster where a gather is cheap (Sapphire Rapids).
+bool iq512_gather_on() noexcept;
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);
@@ -21,5 +24,18 @@ void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 bool iq512x_supported(int ggml_type) noexcept;
 void iq512x_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                  float* const* out, int r0, int r1);
+
+/// Singleton-equivalent accumulation for types 18, 21 and 22 (the linked ggml AVX2 order, one token or many); the caller
+/// checks the linked ggml ISA.  Used only for window-invariant native arithmetic.
+void iq512_reference_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                             const void* const* act, int nt, float* const* ff, int r0, int r1);
+
+// Gate and up in one pass over the activations, ggml-cpu's dot order for every token (see iq_avx512.cpp)
+bool iq512f_supported(int ggml_type) noexcept;
+void iq512_fused_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                         float* const* ff, int r0, int r1);
+
+// Q5_0 down rows, 512-bit, ggml-cpu's dot bit for bit (see iq_avx512.cpp)
+void q50_512_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out, int r0, int r1);
 
 }  // namespace strata::kernels::cpu

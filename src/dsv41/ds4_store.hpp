@@ -31,7 +31,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace strata::ds4 {
@@ -49,7 +48,7 @@ public:
     enum Policy { kLru = 0, kLfu = 1 };
     struct Stats {
         std::atomic<int64_t> hits{0}, misses{0}, prefetched{0}, prefetch_used{0}, prefetch_wasted{0}, evictions{0}, fails{0};
-        std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0}, cancelled{0};
+        std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0}, cancelled{0}, put{0};
     };
     struct Vis {                 // a slot the GPU may read from now on (dev != 0), or no longer (dev == 0)
         int layer = 0, e = 0;
@@ -71,6 +70,7 @@ public:
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
     };
 
+    void set_pfds(const std::vector<os::fd_t>& pfds) { pfds_ = pfds; }   // (the fallback handles were reopened)
     bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
         cfg_ = c;
         geo_ = layers;
@@ -109,7 +109,6 @@ public:
         return true;
     }
     ~ExpertStore() {
-        warm_stop();
         io_.reset();
         for (size_t i = 0; i < chunks_.size(); ++i)
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
@@ -134,25 +133,6 @@ public:
     }
     const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + geo_[(size_t) slots_[(size_t) slot].layer].tr[r]; }
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
-    /// (layer, e)'s blob copied to dst (n bytes) if it is here and ready - pinned for the copy, its age left alone; false
-    /// otherwise (nothing read)
-    bool copy_out(int layer, int e, uint8_t* dst, size_t n) {
-        if (layer < 0 || layer >= (int) where_.size() || e < 0 || e >= (int) where_[(size_t) layer].size()) return false;
-        int s;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            s = where_[(size_t) layer][(size_t) e];
-            if (s < 0) return false;
-            Slot& sp = slots_[(size_t) s];
-            try_ready(sp);
-            if (sp.state.load(std::memory_order_acquire) != kReady || sp.layer != layer || sp.expert != e) return false;
-            sp.pin++;
-        }
-        std::memcpy(dst, slots_[(size_t) s].base, n);
-        std::lock_guard<std::mutex> lk(mu_);
-        slots_[(size_t) s].pin--;
-        return true;
-    }
     /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
     unsigned long long dev_blob(int slot) const {
         const size_t c = (size_t) slot / kChunk;
@@ -164,34 +144,43 @@ public:
     /// caller releases them.  False if a read failed or no slot could be had for one (ok[i] says which are fine; the caller
     /// reads the others another way).
     bool ensure(int layer, const int* es, int n, std::vector<char>& ok) {
+        std::vector<int> sl;
+        begin(layer, es, n, ok, sl);
+        return wait_slots(sl, ok, 0, n);
+    }
+    /// The first half of ensure(): the experts' slots found or their reads started (pinned), no waiting.  sl[i] is the slot or -1.
+    void begin(int layer, const int* es, int n, std::vector<char>& ok, std::vector<int>& sl) {
         ok.assign((size_t) n, 0);
-        if (layer < 0 || layer >= (int) geo_.size()) return false;
-        std::vector<int> sl((size_t) n, -1);
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            for (int i = 0; i < n; ++i) {
-                const int e = es[i];
-                touch_heat(layer, e);
-                int s = where_[(size_t) layer][(size_t) e];
-                if (s >= 0) {
-                    Slot& sp = slots_[(size_t) s];
-                    try_ready(sp);
-                    if (sp.state.load() == kReady && !sp.prefetch) st_.hits.fetch_add(1, std::memory_order_relaxed);
-                    if (sp.prefetch) st_.prefetch_used.fetch_add(1, std::memory_order_relaxed);
-                    sp.prefetch = false;
-                    sp.pin++;
-                    sp.tick = ++clock_;
-                    sl[(size_t) i] = s;
-                    continue;
-                }
-                st_.misses.fetch_add(1, std::memory_order_relaxed);
-                s = start_fill(layer, e, true);
+        sl.assign((size_t) n, -1);
+        if (layer < 0 || layer >= (int) geo_.size()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int i = 0; i < n; ++i) {
+            const int e = es[i];
+            touch_heat(layer, e);
+            int s = where_[(size_t) layer][(size_t) e];
+            if (s >= 0) {
+                Slot& sp = slots_[(size_t) s];
+                try_ready(sp);
+                if (sp.state.load() == kReady && !sp.prefetch) st_.hits.fetch_add(1, std::memory_order_relaxed);
+                if (sp.prefetch) st_.prefetch_used.fetch_add(1, std::memory_order_relaxed);
+                sp.prefetch = false;
+                sp.pin++;
+                sp.tick = ++clock_;
                 sl[(size_t) i] = s;
+                continue;
             }
+            st_.misses.fetch_add(1, std::memory_order_relaxed);
+            s = start_fill(layer, e, true);
+            sl[(size_t) i] = s;
         }
+    }
+    /// True when the reads of slot sl (from begin) are all done.
+    bool loaded(int s) const { return s >= 0 && slots_[(size_t) s].left.load(std::memory_order_acquire) <= 0; }
+    /// The second half: waits for the slots sl[a..b) and marks ok[i] for the good ones.  False if any failed or had no slot.
+    bool wait_slots(std::vector<int>& sl, std::vector<char>& ok, int a, int b) {
         const auto t0 = std::chrono::steady_clock::now();
         bool all = true;
-        for (int i = 0; i < n; ++i) {
+        for (int i = a; i < b; ++i) {
             const int s = sl[(size_t) i];
             if (s < 0) {
                 all = false;
@@ -267,80 +256,51 @@ public:
         }
         return n;
     }
-    /// `list` (hottest first) read into free slots in the background, at most `depth` reads in flight, so the reads a token
-    /// asks for meanwhile are not queued behind all of them (preload's warm slots, without the wait).  A list given while one
-    /// is still being read replaces it.
-    void warm_async(const std::vector<std::pair<int, int>>& list, int depth) {
-        warm_stop();
-        warm_quit_.store(false);
-        std::vector<std::pair<int, int>> todo(list.begin(), list.begin() + (long) std::min(list.size(), nmax_));
-        // ages by rank, not by read time: the slots are given back oldest first, so the hottest (read first) get the newest
-        // age and a listed expert already here is made as young as its rank - the reads a token asks for later are newer still
-        uint64_t base;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            base = clock_;
-            clock_ += todo.size();
-            for (size_t k = 0; k < todo.size(); ++k) {
-                const int layer = todo[k].first, e = todo[k].second;
-                if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
-                const int sl = where_[(size_t) layer][(size_t) e];
-                if (sl >= 0) slots_[(size_t) sl].tick = base + todo.size() - k;
-            }
+    /// A slot for (layer, e) that the caller fills with the expert's blob itself (an expert the VRAM cache gives back to the CPU lane: its bytes
+    /// are in memory already, so no read from the SSD while the lane waits).  Returns the blob's address, or nullptr (it is here already, or
+    /// no slot can be had).  The slot is pinned and not findable until put_done().
+    uint8_t* put_begin(int layer, int e) {
+        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return nullptr;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (where_[(size_t) layer][(size_t) e] >= 0) return nullptr;
+        const int s = take_slot(false);
+        if (s < 0) return nullptr;
+        Slot& sp = slots_[(size_t) s];
+        if (sp.layer >= 0 && sp.expert >= 0) {
+            where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
+            if (sp.prefetch) st_.prefetch_wasted.fetch_add(1, std::memory_order_relaxed);
+            st_.evictions.fetch_add(1, std::memory_order_relaxed);
         }
-        warm_th_ = std::thread([this, todo = std::move(todo), depth, base] {
-            const auto t0 = std::chrono::steady_clock::now();
-            size_t next = 0, nread = 0;
-            std::vector<int> mine;   // (its own reads under way: the only slots it looks at)
-            while (!warm_quit_.load(std::memory_order_acquire)) {
-                bool loading_left = false;
-                {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    for (size_t j = 0; j < mine.size();) {
-                        Slot& sp = slots_[(size_t) mine[j]];
-                        if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
-                            try_ready(sp);
-                            if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
-                        }
-                        if (sp.state.load(std::memory_order_acquire) == kLoading) ++j;
-                        else {
-                            mine[j] = mine.back();
-                            mine.pop_back();
-                        }
-                    }
-                    int in_flight = (int) mine.size();
-                    // (none started while a token's reads are queued or being read: those wait on nothing of ours but the
-                    // reads already under way)
-                    while (in_flight < depth && next < todo.size() && io_->hi_busy() == 0) {
-                        const int layer = todo[next].first, e = todo[next].second;
-                        ++next;
-                        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
-                        if (where_[(size_t) layer][(size_t) e] >= 0) continue;
-                        const int sl = start_fill(layer, e, false);
-                        if (sl < 0) {
-                            next = todo.size();
-                            break;
-                        }
-                        slots_[(size_t) sl].prefetch = false;   // (warm, not a guess)
-                        slots_[(size_t) sl].tick = base + todo.size() - (next - 1);
-                        mine.push_back(sl);
-                        ++in_flight;
-                        ++nread;
-                    }
-                    loading_left = in_flight > 0;
-                }
-                if (next >= todo.size() && !loading_left) break;
-                io_->wait_any(2000);
-            }
-            if (std::getenv("DS4_WARM_REPORT"))
-                std::fprintf(stderr, "ds4: RAM store: background refill %s: %zu read of %zu listed in %.0f ms\n",
-                             warm_quit_.load() ? "stopped" : "done", nread, todo.size(),
-                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-        });
+        sp.layer = layer;
+        sp.expert = e;
+        sp.pin = 1;
+        sp.prefetch = false;
+        sp.visible = false;
+        sp.tick = ++clock_;
+        sp.bad.store(false);
+        sp.cancel.store(false);
+        sp.left.store(1, std::memory_order_release);
+        sp.state.store(kLoading, std::memory_order_release);
+        where_[(size_t) layer][(size_t) e] = s;
+        st_.put.fetch_add(1, std::memory_order_relaxed);
+        return sp.base;
     }
-    void warm_stop() {
-        warm_quit_.store(true, std::memory_order_release);
-        if (warm_th_.joinable()) warm_th_.join();
+    void put_done(int layer, int e, bool ok) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s < 0) return;
+        Slot& sp = slots_[(size_t) s];
+        if (sp.pin > 0) sp.pin--;
+        if (ok) {
+            sp.left.store(0, std::memory_order_release);
+            sp.state.store(kReady, std::memory_order_release);
+        } else {
+            where_[(size_t) layer][(size_t) e] = -1;
+            sp.layer = sp.expert = -1;
+            sp.left.store(0, std::memory_order_release);
+            sp.state.store(kFree, std::memory_order_release);
+            free_hint_ = std::min<size_t>(free_hint_, (size_t) s);
+        }
     }
     /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
     void cancel_stale(int layer_now) {
@@ -463,13 +423,6 @@ public:
         const int s = where_[(size_t) layer][(size_t) e];
         if (s >= 0) slots_[(size_t) s].visible = false;
     }
-    /// ready slots whose (layer, expert) f says yes to
-    size_t count_ready(const std::function<bool(int, int)>& f) const {
-        size_t n = 0;
-        for (size_t i = 0; i < nalloc_; ++i)
-            if (slots_[i].state.load(std::memory_order_acquire) == kReady && f(slots_[i].layer, slots_[i].expert)) ++n;
-        return n;
-    }
     size_t visible_count() const {
         size_t n = 0;
         for (size_t i = 0; i < nalloc_; ++i) n += slots_[i].visible ? 1 : 0;
@@ -478,7 +431,13 @@ public:
 
 private:
     static constexpr int kFree = 0, kLoading = 1, kReady = 2, kFailed = 3;
-    static constexpr size_t kChunk = 64;   // slots a chunk of the arena
+    // slots a chunk of the arena (the unit the GPU mapping registers; DS4_STORE_CHUNK_SLOTS: a test knob for the registration segment size)
+    static size_t chunk_slots() {
+        const char* e = std::getenv("DS4_STORE_CHUNK_SLOTS");
+        const long v = e ? std::atol(e) : 0;
+        return v >= 8 && v <= 4096 ? (size_t) v : 64;
+    }
+    const size_t kChunk = chunk_slots();
     struct Slot {
         uint8_t* base = nullptr;   // the blob's first byte
         int layer = -1, expert = -1, pin = 0;
@@ -627,8 +586,6 @@ private:
     uint64_t clock_ = 0;
     std::mutex mu_;
     std::unique_ptr<IoQueue> io_;
-    std::thread warm_th_;              // warm_async's reader
-    std::atomic<bool> warm_quit_{false};
     Stats st_;
 };
 
