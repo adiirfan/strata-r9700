@@ -130,8 +130,14 @@ GLM_PATTERN = (
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None, pattern=None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None, pattern=None,
+                 spm: bool = False):
         self.tokens = tokens
+        # spm: Gemma 4's SentencePiece-style BPE (GGUF tokenizer model "gemma4"): spaces become U+2581, the text is
+        # split only into runs of newlines and runs of everything else, merges run on characters (not on GPT-2's byte
+        # alphabet), and a piece outside the vocabulary falls back to its <0xNN> byte tokens (llama.cpp
+        # LLAMA_VOCAB_PRE_TYPE_GEMMA4, Hugging Face's tokenizer.json for Gemma 4)
+        self.spm = spm
         self.pre = pre
         self.ignore_merges = pre in ("glm4", "glm5")   # (GLM_PATTERN above)
         self.token_types = token_types
@@ -151,7 +157,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        if pattern:
+        if spm:
+            self._re = regex.compile(r"[^\n]+|[\n]+")
+            self._split = self._re.findall
+        elif pattern:
             # pattern: the pre-tokenizer's split (another model family's, from its exported tokenizer.json); a list:
             # Hugging Face's Sequence of Split(Isolated) pre-tokenizers, applied one after another, each to every piece
             # the previous one left (matched and unmatched spans both kept, empty matches skipped, as HF does)
@@ -221,13 +230,14 @@ class Tokenizer:
         if missing:
             raise ValueError("GGUF is missing %s; it does not carry a tokenizer" % ", ".join(missing))
         model = md.get("tokenizer.ggml.model")
-        if model != "gpt2":
-            raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2'), got %r" % model)
+        if model not in ("gpt2", "gemma4"):
+            raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2') or Gemma 4's, got %r" % model)
         special = {k: int(md[k]) for k in md
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
-                   md.get("tokenizer.ggml.pre", "qwen35"), special)
+                   md.get("tokenizer.ggml.pre", "gemma4" if model == "gemma4" else "qwen35"), special,
+                   spm=model == "gemma4")
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -307,8 +317,14 @@ class Tokenizer:
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
+        if self.spm:
+            text = text.replace(" ", "\u2581")
         for piece in self._split(text):
             got = cache.get(piece)
+            if got is None and self.spm:
+                got = self._spm_piece(piece)
+                if len(cache) < self.PIECE_CACHE_MAX:
+                    cache[piece] = got
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
@@ -322,6 +338,24 @@ class Tokenizer:
                 if len(cache) < self.PIECE_CACHE_MAX:
                     cache[piece] = got
             out.extend(got)
+        return out
+
+    def _spm_piece(self, piece: str) -> list[int]:
+        """One Gemma 4 piece: a run of newlines that is itself a token stays whole (llama.cpp's fix, PR 21343);
+        otherwise merges over the characters, and each result outside the vocabulary as its UTF-8 bytes."""
+        if piece.strip("\n") == "" and piece in self.ids:
+            return [self.ids[piece]]
+        out = []
+        for tok in self._bpe(piece):
+            i = self.ids.get(tok)
+            if i is not None:
+                out.append(i)
+                continue
+            for b in tok.encode("utf-8"):
+                j = self.ids.get("<0x%02X>" % b)
+                if j is None:
+                    raise KeyError("no byte token for 0x%02X" % b)
+                out.append(j)
         return out
 
     def _encode_matching(self, text: str, pat, plain=(), marks: list | None = None) -> list[int]:
@@ -390,6 +424,13 @@ class Tokenizer:
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            if self.spm:
+                t = self.tokens[i]
+                if self.token_types and self.token_types[i] == 6 and len(t) == 6 and t.startswith("<0x") and t.endswith(">"):
+                    b = cache[i] = bytes([int(t[3:5], 16)])
+                else:
+                    b = cache[i] = t.replace("\u2581", " ").encode("utf-8")
+                return b
             if self.token_types and i < len(self.token_types) and self.token_types[i] in (3, 4):
                 # a special token's string is the literal text (DeepSeek's `<｜User｜>`, `｜DSML｜` hold characters outside
                 # the byte alphabet); for Qwen's ASCII specials it is the same bytes the alphabet would give
@@ -520,7 +561,7 @@ def extract(gguf_path, out_dir) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
     cfg = {
-        "model": "gpt2",
+        "model": "gemma4" if tk.spm else "gpt2",
         "pre": tk.pre,
         "vocab_size": len(tk.tokens),
         "n_merges": len(tk.ranks),
@@ -531,12 +572,19 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.spm:
+        cfg["pre_pattern"] = r"[^\n]+|[\n]+"
+        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_GEMMA4; spaces as U+2581 first)"
+        cfg["add_bos_token"] = True
     if tk.pre == "gpt-4o":
         cfg["pre_pattern"] = GPT4O_PATTERN
         cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_GPT4O, the original regex)"
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
-    (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
-                                              sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
+    merges = ["%s %s" % k for k, _ in sorted(tk.ranks.items(), key=lambda kv: kv[1])]
+    if tk.spm:   # (Gemma's merges join runs of newlines: one a line would not survive, so a JSON list)
+        (out / "merges.json").write_text(json.dumps(merges, ensure_ascii=False), encoding="utf-8")
+    else:
+        (out / "merges.txt").write_text("\n".join(merges), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)

@@ -60,7 +60,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, FlintParser, HarmonyParser, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, FlintParser, Gemma4Parser, HarmonyParser, OutputParser, anthropic_to_messages,  # noqa: E402
                             anthropic_tools, forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -4613,6 +4613,22 @@ def gptoss_tools(tools):
     return [t if isinstance(t, dict) and "function" in t else {"type": "function", "function": t} for t in tools] if tools else tools
 
 
+def gemma4_kwargs(kwargs: dict) -> dict:
+    """Gemma 4's template thinks only when asked (enable_thinking, default off there); here it thinks unless the
+    request turns it off, as the other models do. It has no effort levels."""
+    kw = dict(kwargs)
+    kw.pop("reasoning_effort", None)
+    kw["enable_thinking"] = kw.get("enable_thinking") is not False
+    return kw
+
+
+def gemma4_tools(tools):
+    """Gemma 4's template reads each tool in OpenAI's wrapper ({"type": "function", "function": {...}}); the service
+    keeps the inner declarations."""
+    return [t if isinstance(t, dict) and "function" in t else {"type": "function", "function": t} for t in tools] \
+        if tools else tools
+
+
 def gptoss_kwargs(kwargs: dict) -> dict:
     """gpt-oss's harmony template knows low / medium / high (its default medium), and thinking cannot be turned off
     (low instead)."""
@@ -4909,7 +4925,7 @@ class Service:
         # (the other families' end markers, where each is one token: Nemotron's </s>; Flint ends a turn with <|end_of_text|> or by
         # starting the next one: <|user|>, <|observation|>, <|developer|>; Ling with <|role_end|>; gpt-oss with <|return|> / <|call|>)
         for marker in ("</s>", "<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>", "<|role_end|>", "<|return|>",
-                       "<|call|>"):
+                       "<|call|>", "<turn|>", "<|tool_response>", "<eos>"):
             ids = tokenizer.encode(marker, parse_special=True)
             if len(ids) == 1:
                 self.stop_ids.update(ids)
@@ -5840,6 +5856,8 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         if MODEL_FAMILY == "gptoss":
             return self.template.render(messages, tools=gptoss_tools(tools), **gptoss_kwargs(kwargs))
+        if MODEL_FAMILY == "gemma4":
+            return self.template.render(messages, tools=gemma4_tools(tools), **gemma4_kwargs(kwargs))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -6178,6 +6196,8 @@ class Service:
             kw["add_generation_prompt"] = False
             if MODEL_FAMILY == "gptoss":
                 kw, marked_tools = gptoss_kwargs(kw), gptoss_tools(marked_tools)
+            elif MODEL_FAMILY == "gemma4":
+                kw, marked_tools = gemma4_kwargs(kw), gemma4_tools(marked_tools)
             text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
@@ -6309,9 +6329,15 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         # (Flint and Ling write their calls in their own form: FlintParser turns them into the template form as they stream)
-        parser = (FlintParser if MODEL_FAMILY in ("flint", "ling") else HarmonyParser if MODEL_FAMILY == "gptoss" else self.parser_cls)(
+        parser = (FlintParser if MODEL_FAMILY in ("flint", "ling") else HarmonyParser if MODEL_FAMILY == "gptoss"
+                  else Gemma4Parser if MODEL_FAMILY == "gemma4" else self.parser_cls)(
             thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True, recover=self.tool_call_recovery,
             declared_only=declared_only, deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
+        if MODEL_FAMILY == "gemma4" and isinstance(parser, Gemma4Parser):
+            # after a tool's answer Gemma's template opens the thought channel itself: the reply starts in it
+            opened = self.tok.encode("<|channel>thought\n", parse_special=True)
+            if list(ids[-len(opened):]) == opened:
+                parser.gstate, parser.cname = "thought", None
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -10204,7 +10230,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
+        merges = (json.loads((tpath / "merges.json").read_text(encoding="utf-8")) if (tpath / "merges.json").exists()
+                  else (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"))
         types = json.loads((tpath / "token_type.json").read_text())
         tcfg = {}
         try:                                            # the pack's pre-tokenizer name and special ids (DeepSeek's differ),
@@ -10212,7 +10239,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         except (OSError, ValueError):                   # pattern (a list: several splits in order; Qwen's is the default)
             pass
         tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None,
-                           pattern=tcfg.get("pre_patterns") or tcfg.get("pre_pattern"))
+                           pattern=tcfg.get("pre_patterns") or tcfg.get("pre_pattern"), spm=tcfg.get("model") == "gemma4")
     if a.engine == "strata" and not cfg.get("arch") and arch_from_tokenizer(None, tcfg.get("pre")):
         cfg["arch"] = arch_from_tokenizer(None, tcfg.get("pre"))
         print(f"[strata] the config names no \"arch\" and this tokenizer is DeepSeek's: serving it as {cfg['arch']} (its end token, DSML tool "

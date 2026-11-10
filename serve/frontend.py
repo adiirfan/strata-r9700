@@ -2298,3 +2298,182 @@ class HarmonyParser(OutputParser):
             tail += self._call()
         out = super().feed(tail) if tail else []
         return out + super().finish(*a, **kw)
+
+
+GEMMA_Q = '<|"|>'
+
+
+def gemma_args(text: str):
+    """Gemma 4's call arguments (its template's format_argument): `k:v,k:v` with strings as <|"|>...<|"|>, numbers and
+    true / false / null bare, lists [..] and objects {..}. -> a dict, or None when it does not parse."""
+    i = 0
+
+    def value():
+        nonlocal i
+        if text.startswith(GEMMA_Q, i):
+            j = text.find(GEMMA_Q, i + len(GEMMA_Q))
+            if j < 0:
+                raise ValueError("an open string")
+            v = text[i + len(GEMMA_Q):j]
+            i = j + len(GEMMA_Q)
+            return v
+        if text.startswith("{", i):
+            i += 1
+            return obj("}")
+        if text.startswith("[", i):
+            i += 1
+            out = []
+            while i < len(text) and text[i] != "]":
+                out.append(value())
+                if i < len(text) and text[i] == ",":
+                    i += 1
+            i += 1
+            return out
+        j = i
+        while j < len(text) and text[j] not in ",}]":
+            j += 1
+        raw = text[i:j].strip()
+        i = j
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw
+
+    def obj(close):
+        nonlocal i
+        out = {}
+        while i < len(text) and text[i] != close:
+            if text.startswith(GEMMA_Q, i):
+                key = value()
+            else:
+                j = text.find(":", i)
+                if j < 0:
+                    raise ValueError("a key without a value")
+                key = text[i:j].strip()
+                i = j
+            if i >= len(text) or text[i] != ":":
+                raise ValueError("a key without a value")
+            i += 1
+            out[key] = value()
+            if i < len(text) and text[i] == ",":
+                i += 1
+        i += 1
+        return out
+
+    try:
+        return obj("\0")
+    except (ValueError, IndexError):
+        return None
+
+
+class Gemma4Parser(OutputParser):
+    """Gemma 4 thinks in `<|channel>thought\\n...<channel|>` and calls a tool as `<|tool_call>call:NAME{k:v,...}
+    <tool_call|>` (its chat template; <|tool_response> ends the turn there, a stop token). This rewrites that, as it
+    streams, into the form OutputParser reads: the thought channel is the reasoning, `</think>` follows it (or comes
+    first when the reply starts without one: thinking off puts an empty channel in the prompt), and a call becomes
+    `<tool_call>\\n<function=NAME>\\n<parameter=K>\\nV\\n</parameter>...`."""
+
+    MARKS = ("<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>")
+
+    def __init__(self, *a, **kw):
+        kw["thinking"] = True
+        super().__init__(*a, **kw)
+        self.gstate = "start"        # start | thought (after <|channel>: its name, then the reasoning) | text | call
+        self.gbuf = ""
+        self.cname = ""              # the channel's name line, until its newline
+        self.call = ""
+        self.closed = False
+
+    def _close_think(self) -> str:
+        # (a line break first: <channel|> is a token and always the end, but a `</think>` right after a quote mark is
+        # read as the model quoting the tag (#537), and Gemma often ends its thinking on a quoted draft: `..."<channel|>`)
+        if self.closed:
+            return ""
+        self.closed = True
+        return "\n" + THINK_END
+
+    def _emit_call(self) -> str:
+        body = self.call
+        self.call = ""
+        name, _, args = body.partition("{")
+        name = name.strip()
+        if name.startswith("call:"):
+            name = name[5:]
+        parsed = gemma_args(args[:-1] if args.endswith("}") else args) if args else {}
+        out = [self._close_think(), "<tool_call>\n<function=" + name + ">\n"]
+        for k, v in (parsed or {}).items():
+            out.append(f"<parameter={k}>\n{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}\n</parameter>\n")
+        out.append("</function>\n</tool_call>")
+        return "".join(out)
+
+    def _plain(self, t: str) -> str:
+        if not t:
+            return ""
+        if self.gstate == "start":
+            if not t.strip():
+                return ""
+            self.gstate = "text"
+            return self._close_think() + t.lstrip()
+        if self.gstate == "thought":
+            if self.cname is not None:        # the channel's name ("thought") up to its newline
+                k = t.find("\n")
+                if k < 0:
+                    self.cname += t
+                    return ""
+                self.cname = None
+                t = t[k + 1:]
+            return t
+        if self.gstate == "call":
+            self.call += t
+            return ""
+        return t
+
+    def _mark(self, m: str) -> str:
+        if m == "<|channel>" and self.gstate in ("start", "text") and not self.closed:
+            self.gstate, self.cname = "thought", ""
+            return ""
+        if m == "<channel|>" and self.gstate == "thought":
+            self.gstate = "text"
+            return self._close_think()
+        if m == "<|tool_call>" and self.gstate != "call":
+            self.gstate, self.call = "call", ""
+            return ""
+        if m == "<tool_call|>" and self.gstate == "call":
+            self.gstate = "text"
+            return self._emit_call()
+        return "" if m in ("<|channel>", "<channel|>") else self._plain(m)
+
+    def _translate(self, final: bool = False) -> str:
+        out = []
+        while self.gbuf:
+            i = self.gbuf.find("<")
+            if i < 0:
+                out.append(self._plain(self.gbuf))
+                self.gbuf = ""
+                break
+            out.append(self._plain(self.gbuf[:i]))
+            rest = self.gbuf[i:]
+            m = next((t for t in self.MARKS if rest.startswith(t)), None)
+            if m is None and not final and any(t.startswith(rest) for t in self.MARKS):
+                self.gbuf = rest
+                break
+            if m is None:
+                out.append(self._plain("<"))
+                self.gbuf = rest[1:]
+            else:
+                out.append(self._mark(m))
+                self.gbuf = rest[len(m):]
+        return "".join(out)
+
+    def feed(self, delta: str) -> list[Event]:
+        self.gbuf += delta
+        return super().feed(self._translate())
+
+    def finish(self, *a, **kw):
+        tail = self._translate(final=True)
+        if self.gstate == "call" and self.call:
+            tail += self._emit_call()
+        elif not self.closed and self.gstate == "thought":
+            tail += self._close_think()
+        out = super().feed(tail) if tail else []
+        return out + super().finish(*a, **kw)

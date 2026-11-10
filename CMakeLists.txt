@@ -510,6 +510,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata-gptoss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata-gptoss PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
 
+  # Gemma 4 26B-A4B (src/gemma4): its own program on the GGUF's Q8_0, the whole model on the card
+  add_executable(strata-gemma4 src/gemma4/gemma4_main.cu)
+  target_include_directories(strata-gemma4 PRIVATE ${_strata_gpu_include_directories})
+  target_include_directories(strata-gemma4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata-gemma4 PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
+
   add_executable(strata-concurrent src/core/concurrent_main.cpp)
   target_include_directories(strata-concurrent PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-concurrent PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})
@@ -918,6 +924,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
+    if(TARGET strata-gemma4)
+      target_compile_definitions(strata-gemma4 PRIVATE GEMMA4_BLT=1)
+      target_link_libraries(strata-gemma4 PRIVATE roc::hipblaslt)
+    endif()
 
     add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
