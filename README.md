@@ -1,18 +1,24 @@
 # strata-r9700: DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, gpt-oss-120b, Nemotron 3.5 Bolt and Recursive Flint on one Radeon AI PRO R9700
 
-This is [Strata](https://github.com/Niko1221/Strata) 0.2.4 (commit `96ca4383`) tuned for a 32 GB Radeon AI PRO R9700,
+This is [Strata](https://github.com/Niko1221/Strata) 0.2.18 (merged from 0.2.4 through 0.2.12; the measurements below are
+from 0.2.4) tuned for a 32 GB Radeon AI PRO R9700,
 with four more models beside Strata's own. Every model works behind Strata's server, which offers OpenAI- and
 Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.md](README-STRATA.md).
+
+**Since 0.2.16** Strata keeps its engine in `engine/` and its server in `terminal/`; the programs of this repo moved
+with it (`engine/src/<model>/`, built by `tools/r9700/build-<model>.sh`). Strata 0.2.16 also removed its DeepSeek-V4.1
+engine, so `engine/strata-dsv41` and its picture path are no longer in this repo; the DeepSeek sections below describe
+the last version that had it (commit `32d800f45`).
 
 - **Qwen3.8-Flash-Next** is Strata's own model. This repo adds the R9700 work from
   [strata-patches](https://github.com/adiirfan/strata-patches): 8-bit matrix maths for prompts, conversation memory that
   is pinned only as a conversation grows, and experts given back from RAM after a long prompt.
-- **DeepSeek-V4.1-Flash**: Strata 0.2.4 carries its engine (`src/dsv41/`, from Project Maya). This repo tunes it for
+- **DeepSeek-V4.1-Flash**: Strata 0.2.4 carries its engine (`engine/src/dsv41/`, from Project Maya). This repo tunes it for
   this card and a fast SSD and lets the server pass it pictures.
-- **GLM-5.3-Flash**: Project Maya's GLM engine (v1.1.28), built here as `engine/strata-glm` (`src/glm/`), with the
+- **GLM-5.3-Flash**: Project Maya's GLM engine (v1.1.28), built here as `engine/strata-glm` (`engine/src/glm/`), with the
   server, the tokenizer and the picture encoder taught GLM's ways, and its prompt path made several times faster on
   this card.
-- **gpt-oss-120b**: a program of its own (`engine/strata-gptoss`, `src/gptoss/`), written for this card: the 61 GB of
+- **gpt-oss-120b**: a program of its own (`engine/strata-gptoss`, `engine/src/gptoss/`), written for this card: the 61 GB of
   experts split between the card and the processor, with the card's share following the conversation.
 - **Nemotron 3.5 Bolt, Recursive Flint and Ling-3.0-flash** are programs of their own. (This repo was `strata-nemo`,
   built on an older Strata. Nemotron, with and without its drafter, and Flint give the same output, token for token, on
@@ -20,19 +26,19 @@ Anthropic-compatible APIs and a web app. Strata's own README is [README-STRATA.m
 
 | Program | Model | Weights | Where they live | Context | Code |
 | --- | --- | --- | --- | ---: | --- |
-| `engine/strata-dsv41` | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), [ISTA-DASLab's 2-bit GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | 138 GB + 111 GB of Engram tables | card + RAM + SSD | 262,144 | `src/dsv41/`, `serve/ds4_images.py` |
-| `engine/strata-glm` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) 321B-A18B, [Maya-M-Derisked IQ2_S GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF) (fewer blanket refusals), vision files from [the Maya release](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) | 116 GB, of it 97 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `src/glm/`, `tools/glm/`, `tools/vision/glm5next*` |
-| `engine/strata-r9700` | [Qwen3.8-Flash-Next](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) (SC117's abliterated GSQ-RCO IQ3_S) | 79 GB, of it 50 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `src/core/`, `src/prefill/`, `src/program/` |
-| `engine/strata-nemo` | [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB), with the [LiLiCorr drafter](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) | 24 GB | all on the card | 262,144 | `src/nemotron/` |
-| `engine/strata-flint` | [Recursive Flint 40B-A2.5B](https://huggingface.co/RecursiveSI/flint), [Q4_1 GGUF](https://huggingface.co/RecursiveSI/flint-int4-gguf) | 26 GB | all on the card | 262,144 | `src/flint/` |
-| `engine/strata-gptoss` | [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) | 63 GB, of it 61 GB of experts | card + RAM | 131,072 | `src/gptoss/`, `tools/gptoss/` |
-| `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + RAM | 131,072 | `src/ling/` |
+| `engine/strata-dsv41` | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), [ISTA-DASLab's 2-bit GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | 138 GB + 111 GB of Engram tables | card + RAM + SSD | 262,144 | `engine/src/dsv41/`, `terminal/serve/ds4_images.py` |
+| `engine/strata-glm` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) 321B-A18B, [Maya-M-Derisked IQ2_S GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF) (fewer blanket refusals), vision files from [the Maya release](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) | 116 GB, of it 97 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `engine/src/glm/`, `tools/glm/`, `terminal/tools/vision/glm5next*` |
+| `engine/strata-r9700` | [Qwen3.8-Flash-Next](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) (SC117's abliterated GSQ-RCO IQ3_S) | 79 GB, of it 50 GB of experts | card + RAM (+ SSD with a cap) | 262,144 | `engine/src/core/`, `engine/src/prefill/`, `engine/src/program/` |
+| `engine/strata-nemo` | [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB), with the [LiLiCorr drafter](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) | 24 GB | all on the card | 262,144 | `engine/src/nemotron/` |
+| `engine/strata-flint` | [Recursive Flint 40B-A2.5B](https://huggingface.co/RecursiveSI/flint), [Q4_1 GGUF](https://huggingface.co/RecursiveSI/flint-int4-gguf) | 26 GB | all on the card | 262,144 | `engine/src/flint/` |
+| `engine/strata-gptoss` | [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) | 63 GB, of it 61 GB of experts | card + RAM | 131,072 | `engine/src/gptoss/`, `tools/gptoss/` |
+| `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + RAM | 131,072 | `engine/src/ling/` |
 
 ## Results
 
 Every model was measured the same way, through the server, one after another on the same desktop:
 
-1. **Strata's benchmark,** `tools/strata_bench.py --long`: three short chats, fresh 4K, 16K and 32K prompts, and a
+1. **Strata's benchmark,** `terminal/tools/strata_bench.py --long`: three short chats, fresh 4K, 16K and 32K prompts, and a
    six-turn agent session with four tools. Each test three times; the table gives the median.
 2. **A reading and writing sweep,** `tools/r9700/sweep_bench.py`: fresh prompts of 1K to 256K tokens, each answered once
    with up to 128 tokens and once with up to 1,024.
@@ -481,7 +487,7 @@ Measured on the desktop above, against llama.cpp (its ROCm build, flash attentio
   prompt chunk (4096), `GPTOSS_RESERVE_GB` the card memory left free (3), `GPTOSS_CPU_THREADS`.
 - **Server:** `"model_family": "gptoss"` reads its harmony format (the analysis channel is the thinking, a call to
   `functions.NAME` a tool call); `reasoning_effort` low / medium / high (high: the top), and thinking cannot be turned
-  off (low instead). The tokenizer: `tools/strata_tokenizer.py --gguf MODEL.gguf --out DIR` (its `gpt-4o` pattern).
+  off (low instead). The tokenizer: `terminal/tools/strata_tokenizer.py --gguf MODEL.gguf --out DIR` (its `gpt-4o` pattern).
 - **Build:** `tools/r9700/build-gptoss.sh <ROCm 10 SDK dir>`. It needs about 62 GB of free RAM for the expert copy.
 
 ## Build
@@ -577,8 +583,8 @@ Write the model's tokenizer folder, then a config for it:
 
 ```sh
 python3 tools/nemotron/export_tokenizer.py <model dir> <tokenizer dir>                 # Nemotron
-python3 tools/strata_tokenizer.py --gguf flint-int4-q4_1.gguf --out <dir>                # Flint: <dir>/tokenizer
-python3 tools/strata_tokenizer.py --gguf Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf --out <dir>   # Ling
+python3 terminal/tools/strata_tokenizer.py --gguf flint-int4-q4_1.gguf --out <dir>                # Flint: <dir>/tokenizer
+python3 terminal/tools/strata_tokenizer.py --gguf Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf --out <dir>   # Ling
 python -m serve.server --engine strata --config strata-ling.json --port 8080
 ```
 
@@ -671,7 +677,7 @@ setup above:
   "tokenizer": "<pack dir>/tokenizer",
   "port": 8080,
   "backend": "hip",
-  "env": {"STRATA_HIPBLASLT_TUNING": "tools/hip/gfx1201-hipblaslt-100500.txt", "STRATA_HIP_WMMA": "1",
+  "env": {"STRATA_HIPBLASLT_TUNING": "terminal/tools/hip/gfx1201-hipblaslt-100500.txt", "STRATA_HIP_WMMA": "1",
           "STRATA_SELECT_WMMA": "1", "STRATA_PF_FUSED": "1", "STRATA_ROUTE_RESIDENT": "1", "STRATA_UNBUFFERED_LOAD": "1",
           "HSA_USERPTR_FOR_PAGED_MEM": "0", "STRATA_PF_FP8": "1", "STRATA_PF_FUSED_F8": "1", "STRATA_PF_DM16": "1",
           "STRATA_REFILL_ASYNC": "1", "STRATA_WARMUP_TOKENS": "4096", "GPU_MAX_HW_QUEUES": "2"}
@@ -728,7 +734,7 @@ name them.
 
 ## Limits
 
-- The programs take and give token ids. The tokenizer, chat template and API are Strata's Python server (`serve/`).
+- The programs take and give token ids. The tokenizer, chat template and API are Strata's Python server (`terminal/serve/`).
 - Nemotron's command line writes greedily only.
 - DeepSeek's speed depends on the SSD and on how much RAM its store gets; a prompt costs at least one pass over the
   experts the card does not hold. Its leave-out setting trades some accuracy for speed; set it to 0 for the full model.

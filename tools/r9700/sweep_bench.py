@@ -16,7 +16,7 @@ import random
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "terminal" / "tools"))
 from strata_bench import chat  # noqa: E402  the same streamed, greedy, thinking-off request
 
 SIZES = [1024, 4096, 16384, 32768, 65536, 131072, 250000]   # (the last: 256K less room for the answer)
