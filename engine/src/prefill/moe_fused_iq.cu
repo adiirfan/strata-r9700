@@ -3536,9 +3536,11 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
     ck(cudaGetLastError(), "quantize_act_native");
 }
 
+static thread_local bool g_dm16_block = false;   // per host thread, like g_dm16_want: a stage's staged calls set it on their own thread
+void block_dm16(bool on) { g_dm16_block = on; }
 bool dm16_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_DM16"); return v != nullptr && v[0] == '1'; }();
-    if (!on) return false;
+    if (!on || g_dm16_block) return false;
     const DevInfo& d = dev_info();
     return d.ok && d.w12;
 }

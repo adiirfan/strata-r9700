@@ -41,6 +41,9 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 bool native_f8_gu(int gu_type);
 /// STRATA_PF_DM16=1 on gfx12: experts_native stores the down rows as BF16 (2 bytes per value in `dm`); moe_combine_bf16 reads them.
 bool dm16_on();
+/// The staged group entry's calls (prefill.cpp fz_staged and the layer-major walk) combine their down rows with moe_combine (FP32):
+/// block_dm16(true) around them keeps experts_native from storing BF16 there (dm16_on() answers false until block_dm16(false)).
+void block_dm16(bool on);
 void quantize_act_f8(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
 
 /// experts() for native blobs: b.blob[e - e0] is the native blob of expert e (gate at 0, up at g.up_off, down at

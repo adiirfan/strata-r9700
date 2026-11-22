@@ -192,6 +192,7 @@ bool native_supported(int, int) { return false; }
 void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
 bool native_f8_gu(int) { return false; }
 bool dm16_on() { return false; }
+void block_dm16(bool) {}
 void quantize_act_f8(const float*, int64_t, int64_t, void*, void*) {}
 void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
@@ -6292,7 +6293,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
 #endif
                             }
-                            fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                            // the staged experts_native takes the FP8 product where native_f8_gu() says so: its activations then come from quantize_act_f8
+                            if (fused::native_f8_gu(mmq_gt)) fused::quantize_act_f8(m.mixed, T, N, m.Xq, m.cs);
+                            else fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
                         if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
                             if (static bool said = false; !said) {
@@ -7066,7 +7069,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 pt.mark(kPfGemmGU, cs);
                                 fused::want_dm_f16(false);
                                 // the layer's tables (group_bounds, before the walk) and rows: the batch's experts are local indices of them
+                                fused::block_dm16(true);   // moe_combine reads these down rows as FP32 (m.dm16 is set for the stream_all path only)
                                 fused::experts_native(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                fused::block_dm16(false);
                                 if (gg_nslots > 0) {   // the batch's staged blobs are read: one event releases their slots
                                     const int rel = gg_slots[gg_nslots - 1];
                                     cudaEventRecord(m.used[rel], m.cs);
@@ -8681,7 +8686,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         if (fz_l) {
             const auto& f = lay.fmt[(size_t) l];
             fz_geom = fused::NativeGeom{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
-            fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
+            if (fused::native_f8_gu(f.gu_type)) fused::quantize_act_f8(lb.mixed, Sn, N, lb.xa, cs);   // as the staged entry: FP8 products need FP8 rows
+            else fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
         }
         mmq::GatherGroup gg;
         int gg_slots[MMQ_GROUP];
@@ -8762,7 +8768,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 fb.e1 = ngx;
                 for (int i = 0; i < ngx; ++i) fb.blob[i] = fz_blob[i];
                 fused::want_dm_f16(false);
+                fused::block_dm16(true);   // combined as FP32 rows
                 fused::experts_native(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
+                fused::block_dm16(false);
                 for (int i = 0; i < fz_nrel; ++i) {   // the group's staged blobs are read: their slots are free
                     cudaEventRecord(m.used[fz_rel[i]], cs);
                     m.used_of[fz_rel[i]] = fz_rel[i];
