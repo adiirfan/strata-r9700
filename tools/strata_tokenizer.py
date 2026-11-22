@@ -131,7 +131,7 @@ GLM_PATTERN = (
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None, pattern=None,
-                 spm: bool = False):
+                 spm: bool = False, ignore_merges: bool | None = None):
         self.tokens = tokens
         # spm: Gemma 4's SentencePiece-style BPE (GGUF tokenizer model "gemma4"): spaces become U+2581, the text is
         # split only into runs of newlines and runs of everything else, merges run on characters (not on GPT-2's byte
@@ -139,7 +139,8 @@ class Tokenizer:
         # LLAMA_VOCAB_PRE_TYPE_GEMMA4, Hugging Face's tokenizer.json for Gemma 4)
         self.spm = spm
         self.pre = pre
-        self.ignore_merges = pre in ("glm4", "glm5")   # (GLM_PATTERN above)
+        # (GLM_PATTERN above; or the tokenizer.json says so: Inkling 2's o200k-style BPE)
+        self.ignore_merges = pre in ("glm4", "glm5") if ignore_merges is None else bool(ignore_merges)
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}

@@ -516,6 +516,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata-gemma4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata-gemma4 PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
 
+  # Inkling 2 Mini (src/inkling): its own program on the safetensors' NVFP4 / MXFP8 experts, the whole model on the card
+  add_executable(strata-inkling src/inkling/inkling_main.cu)
+  target_include_directories(strata-inkling PRIVATE ${_strata_gpu_include_directories})
+  target_include_directories(strata-inkling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata-inkling PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
+
   add_executable(strata-concurrent src/core/concurrent_main.cpp)
   target_include_directories(strata-concurrent PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-concurrent PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})
@@ -927,6 +933,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(TARGET strata-gemma4)
       target_compile_definitions(strata-gemma4 PRIVATE GEMMA4_BLT=1)
       target_link_libraries(strata-gemma4 PRIVATE roc::hipblaslt)
+    endif()
+    if(TARGET strata-inkling)
+      target_compile_definitions(strata-inkling PRIVATE INKLING_BLT=1)
+      target_link_libraries(strata-inkling PRIVATE roc::hipblaslt)
     endif()
 
     add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)

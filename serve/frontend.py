@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+import jinja2.ext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 LOGGER = logging.getLogger(__name__)
@@ -41,6 +42,20 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 GLM_EFFORT = {"low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
 
 
+class _GenerationTag(jinja2.ext.Extension):
+    """transformers' {% generation %} ... {% endgeneration %} (it marks the assistant's own text for training masks):
+    rendered as its body, as apply_chat_template does (Inkling 2's template uses it)."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return jinja2.nodes.CallBlock(self.call_method("_body"), [], [], body).set_lineno(lineno)
+
+    def _body(self, caller):
+        return caller()
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
@@ -51,7 +66,7 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", _GenerationTag])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = lambda fmt: __import__("datetime").datetime.now().strftime(fmt)   # (gpt-oss's template)
@@ -2191,6 +2206,132 @@ class FlintParser(OutputParser):
 
     def finish(self, *a, **kw):
         tail = self._translate(final=True)
+        out = super().feed(tail) if tail else []
+        return out + super().finish(*a, **kw)
+
+
+class InklingParser(OutputParser):
+    """Inkling 2 writes each part of its turn as a message: `<|message_model|><|content_thinking|>...<|end_message|>`
+    (its reasoning), `<|message_model|><|content_text|>...<|end_message|>` (the answer) and, for a tool call,
+    `<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>`; the turn ends with
+    <|content_model_end_sampling|> (a stop token). This rewrites that, as it streams, into the form OutputParser reads:
+    the thinking content is the reasoning, `</think>` follows it (or comes first when the reply opens with text or a
+    call), and a call becomes `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>...`."""
+
+    MARKS = ("<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>",
+             "<|content_invoke_tool_text|>", "<|end_message|>", "<|content_model_end_sampling|>")
+
+    def __init__(self, *a, **kw):
+        kw["thinking"] = True
+        super().__init__(*a, **kw)
+        self.istate = "between"      # between | head (after <|message_model|>: a call's name) | thought | text | call
+        self.ibuf = ""
+        self.head = ""
+        self.call = ""
+        self.closed = False
+        self.texts = 0               # answer messages so far (a second one is joined to the first by a line break)
+
+    def _close_think(self) -> str:
+        if self.closed:
+            return ""
+        self.closed = True
+        return "\n" + THINK_END
+
+    def _emit_call(self) -> str:
+        body, self.call = self.call.strip(), ""
+        name, args = self.head.strip(), {}
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict):
+                name = str(obj.get("name") or name)
+                args = obj.get("args", obj.get("arguments", {}))
+        except ValueError:
+            obj = lenient_json(body)
+            if isinstance(obj, dict):
+                name = str(obj.get("name") or name)
+                args = obj.get("args", {})
+        out = [self._close_think(), "<tool_call>\n<function=" + name + ">\n"]
+        for k, v in (args if isinstance(args, dict) else {}).items():
+            out.append(f"<parameter={k}>\n{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}\n</parameter>\n")
+        out.append("</function>\n</tool_call>")
+        return "".join(out)
+
+    def _plain(self, t: str) -> str:
+        if not t:
+            return ""
+        if self.istate == "head":
+            self.head += t
+            return ""
+        if self.istate == "call":
+            self.call += t
+            return ""
+        if self.istate == "between":              # (outside a message: only stray whitespace is expected)
+            if not t.strip():
+                return ""
+            self.istate = "text"
+            return self._close_think() + t
+        return t
+
+    def _mark(self, m: str) -> str:
+        st = self.istate
+        if m == "<|message_model|>":
+            if st == "call":                       # (a call cut short: what came is the call)
+                self.istate, self.head = "head", ""
+                return self._emit_call()
+            self.istate, self.head = "head", ""
+            return ""
+        if m == "<|content_thinking|>" and st in ("head", "between"):
+            self.istate = "thought" if not self.closed else "text"
+            return ""
+        if m == "<|content_text|>" and st in ("head", "between"):
+            self.istate = "text"
+            self.texts += 1
+            return self._close_think() + ("\n\n" if self.texts > 1 else "")
+        if m in ("<|content_invoke_tool_json|>", "<|content_invoke_tool_text|>") and st in ("head", "between"):
+            self.istate, self.call = "call", ""
+            return ""
+        if m == "<|end_message|>":
+            out = self._emit_call() if st == "call" else ""
+            self.istate = "between"
+            return out
+        if m == "<|content_model_end_sampling|>":
+            out = self._emit_call() if st == "call" else ""
+            self.istate = "between"
+            return out
+        return self._plain(m)
+
+    def _translate(self, final: bool = False) -> str:
+        out = []
+        while self.ibuf:
+            i = self.ibuf.find("<")
+            if i < 0:
+                out.append(self._plain(self.ibuf))
+                self.ibuf = ""
+                break
+            out.append(self._plain(self.ibuf[:i]))
+            rest = self.ibuf[i:]
+            m = next((t for t in self.MARKS if rest.startswith(t)), None)
+            if m is None and not final and any(t.startswith(rest) for t in self.MARKS):
+                self.ibuf = rest
+                break
+            if m is None:
+                out.append(self._plain("<"))
+                self.ibuf = rest[1:]
+            else:
+                out.append(self._mark(m))
+                self.ibuf = rest[len(m):]
+        return "".join(out)
+
+    def feed(self, delta: str) -> list[Event]:
+        self.ibuf += delta
+        return super().feed(self._translate())
+
+    def finish(self, *a, **kw):
+        tail = self._translate(final=True)
+        if self.istate == "call" and self.call:
+            tail += self._emit_call()
+        elif not self.closed:
+            tail += self._close_think()
         out = super().feed(tail) if tail else []
         return out + super().finish(*a, **kw)
 
