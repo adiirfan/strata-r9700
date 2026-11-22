@@ -233,36 +233,6 @@ Not measured. At this cap GLM writes about 6 tokens/s (Strata's benchmark above)
 - **With less RAM,** Qwen's short prompts slow down most (the experts they need come from the SSD); long prompts share
   each pass over the experts among more tokens and lose less.
 
-### Pagoda test
-
-One creative coding task to each model in the [Pi](https://github.com/badlogic/pi-mono) coding agent (0.57.2), which
-lets the model write files and run commands. Each model ran at its all-in-RAM setting and its top thinking level, with
-no limit on thinking or answer length. The task:
-
-> Design and create a very creative, elaborate, and detailed voxel art scene of a pagoda in a beautiful garden with
-> trees, including some cherry blossoms. Make the scene impressive and varied and use colorful voxels. Use whatever
-> libraries to get this done but make sure I can paste it all into a single HTML file and open it in Chrome.
->
-> Save the finished page as pagoda.html in the current folder. To test it, run `check-page pagoda.html`: it opens the
-> page in headless Chrome (software graphics, no GPU), waits 15 seconds, and prints any errors and how much of the
-> screen is drawn. Keep testing and fixing until it works.
-
-![The six pages side by side](examples/pagoda/compare.gif)
-
-| Model | Time | Commands | Checker calls | The page |
-| --- | ---: | ---: | ---: | --- |
-| DeepSeek-V4.1-Flash | 6,574 s | 80 | 5 | Works: the most detailed scene |
-| GLM-5.3-Flash | 880 s | 13 | 3 | Works |
-| Nemotron 3.5 Bolt | 535 s | 17 | 6 | Works: a simple scene |
-| Qwen3.8-Flash-Next | 3,583 s | 102 | 9 | Builds the scene, but it comes out washed-out white |
-| Gyro-S (Qwen3.8-Flash-Next, all on the card) | 789 s | 6 | 2 | Empty: it builds 0 voxels |
-| Recursive Flint | 170 s | 15 | 3 | Blank: an error on load |
-
-- Every model stopped on its own with a saved page; none needed a nudge to go on. "Checker calls" counts the commands
-  that used `check-page`, including reading it.
-- The pages are in [examples/pagoda](examples/pagoda) as the models left them. The pictures come from Chrome on the
-  R9700 through ANGLE's OpenGL, with the same random seed for every page.
-
 ## DeepSeek-V4.1-Flash
 
 DeepSeek-V4.1-Flash-1017 has 40 layers with 384 experts each, 6 used per token, plus two Engram layers (a lookup
