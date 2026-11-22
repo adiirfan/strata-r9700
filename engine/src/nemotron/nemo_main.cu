@@ -1137,7 +1137,9 @@ struct Model {
         CK(cudaMalloc(&B->xq2, strata::prefill::mmq::q8_bytes(int64_t(T), kShared)));   // (mmq_dense: K <= kShared)
         std::string err;
         if (!B->gemm.init(stream, std::max<int64_t>(int64_t(kInProj) * kHidden, int64_t(kHidden) * kAux), err)) { std::fprintf(stderr, "strata-nemo: %s\n", err.c_str()); std::exit(1); }
-        if (!strata::prefill::mmq::built()) { std::fprintf(stderr, "strata-nemo: this build has no MMQ\n"); std::exit(1); }
+        if (!strata::prefill::mmq::built() && (!moe_wmma || sh_mmq)) {   // (the dense products fall back to BF16 GEMMs; these two cannot)
+            std::fprintf(stderr, "strata-nemo: NEMO_MOE_MMQ / NEMO_SH_MMQ need MMQ, and this build has none\n"); std::exit(1);
+        }
         // the FP8 weight pipeline: slots, a side stream, and the products in the order the prompt pass runs them
         if (!B->w8) {
             CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
@@ -1196,6 +1198,14 @@ struct Model {
     int one_bounds_t = -1;                                          // the T that B->one_bounds holds
     void mmq_dense(const void* W, int type, const float* X, float* Y, int T, int N, int K) {
         namespace mq = strata::prefill::mmq;
+        if (!mq::built()) {
+            // 0.2.16 dropped llama.cpp's MMQ from the tree: the weight unpacked to BF16 (exact for Q8_0), X to BF16
+            // (closer than MMQ's int8 rows), and the BLAS GEMM, as the NVFP4 products do
+            strata::kernels::iq_dequant_bf16(type, W, int64_t(N) * K, B->gemm.scratch(), stream);
+            k_to_bf16<<<1024, 256, 0, stream>>>(X, B->xb, size_t(T) * K);
+            B->gemm.bf16(B->xb, B->gemm.scratch(), Y, T, N, K);
+            return;
+        }
         mq::quantize(X, nullptr, B->xq2, type, K, K, T, stream);
         const int32_t* bounds = B->one_bounds;
         if (T <= kTMax) bounds = B->small_bounds + 2 * T;          // preset {0, T}: no host copy, so graphs can hold it
@@ -1977,8 +1987,12 @@ int main(int argc, char** argv) {
         char exe[4096] = {};
         const ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
         std::string tbl = std::string(exe, len > 0 ? size_t(len) : 0);
-        tbl = tbl.substr(0, tbl.rfind('/')) + "/../tools/hip/gfx1201-hipblaslt-100500.txt";
-        if (FILE* f = std::fopen(tbl.c_str(), "r")) { std::fclose(f); setenv("STRATA_HIPBLASLT_TUNING", tbl.c_str(), 0); }
+        tbl = tbl.substr(0, tbl.rfind('/'));
+        // the 0.2.16 layout keeps the tables in terminal/tools/hip; older trees (and engine/ copies) in tools/hip
+        for (const char* rel : {"/../terminal/tools/hip/", "/../tools/hip/", "/../../terminal/tools/hip/"}) {
+            const std::string p = tbl + rel + "gfx1201-hipblaslt-100500.txt";
+            if (FILE* f = std::fopen(p.c_str(), "r")) { std::fclose(f); setenv("STRATA_HIPBLASLT_TUNING", p.c_str(), 0); break; }
+        }
     }
     Model m(dir, ctx);
     m.init_big();                              // the prompt path's buffers and library, before any prompt is timed
